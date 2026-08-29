@@ -29,6 +29,11 @@ reach Docker Hub but already has a compatible Debian or Ubuntu image, set
 DSH_BASE_IMAGE in .env to that local image tag. The Dockerfile installs a Python
 virtual environment and all Worker dependencies inside the image.
 
+For a host with very slow PyPI access, download compatible wheels into the
+ignored wheelhouse directory before building. When wheelhouse contains .whl
+files, the Dockerfile installs only from those files; otherwise it installs from
+the configured Python package index.
+
 ## Operations
 
     docker compose -f compose.yml ps

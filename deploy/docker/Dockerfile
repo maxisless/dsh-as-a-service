@@ -7,6 +7,7 @@ FROM ${BASE_IMAGE}
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DSH_HTTP_HOST=0.0.0.0 \
     DSH_HTTP_PORT=8765 \
     DSH_WORKSPACE=/data/workspace \
@@ -28,8 +29,12 @@ RUN apt-get update \
     && chown -R dsh:dsh /app /data /config /opt/venv
 
 COPY implementations/python/requirements.txt ./requirements.txt
-RUN python -m pip install --upgrade pip \
-    && python -m pip install --requirement requirements.txt
+COPY deploy/docker/wheelhouse /wheelhouse
+RUN if find /wheelhouse -type f -name '*.whl' -print -quit | grep -q .; then \
+      python -m pip install --no-index --find-links=/wheelhouse --requirement requirements.txt; \
+    else \
+      python -m pip install --requirement requirements.txt; \
+    fi
 
 COPY --chown=dsh:dsh implementations/python/server.py implementations/python/cordis.yml ./
 COPY --chown=dsh:dsh implementations/python/models.json /config/models.json

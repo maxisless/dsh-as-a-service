@@ -21,3 +21,5 @@ models.local.json
 deploy/docker/.env
 deploy/docker/models.json
 deploy/docker/dsh-home/
+deploy/docker/wheelhouse/*
+!deploy/docker/wheelhouse/.gitkeep

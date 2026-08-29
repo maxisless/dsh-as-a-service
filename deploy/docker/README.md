@@ -34,6 +34,17 @@ ignored wheelhouse directory before building. When wheelhouse contains .whl
 files, the Dockerfile installs only from those files; otherwise it installs from
 the configured Python package index.
 
+For a Linux x86_64 host running Python 3.12, one compatible wheelhouse can be
+prepared on a machine with fast PyPI access as follows:
+
+    python -m pip download --dest wheelhouse --only-binary=:all: \
+      --platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 \
+      --implementation cp --python-version 312 --abi cp312 \
+      --requirement implementations/python/requirements.txt
+
+Do not commit the downloaded wheels. Copy them into deploy/docker/wheelhouse on
+the target server before invoking Docker Compose.
+
 ## Operations
 
     docker compose -f compose.yml ps

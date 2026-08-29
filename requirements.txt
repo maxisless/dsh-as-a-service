@@ -1,0 +1,3 @@
+--index-url https://pypi.org/simple
+deepseek-harness-sdk==0.1.1rc1
+PyYAML==6.0.2

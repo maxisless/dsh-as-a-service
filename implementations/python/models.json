@@ -1,0 +1,10 @@
+{
+  "default": "deepseek",
+  "models": {
+    "deepseek": {
+      "provider": "deepseek-official",
+      "endpoint": "deepseek-chat"
+    }
+  },
+  "aliases": {}
+}

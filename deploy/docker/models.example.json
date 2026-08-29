@@ -2,7 +2,7 @@
   "default": "deepseek",
   "models": {
     "deepseek": {
-      "provider": "deepseek",
+      "provider": "deepseek-official",
       "endpoint": "deepseek-chat"
     }
   },

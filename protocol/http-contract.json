@@ -1,0 +1,28 @@
+{
+  "version": "v1",
+  "routes": [
+    {"method": "GET", "path": "/health"},
+    {"method": "GET", "path": "/models"},
+    {"method": "POST", "path": "/chat"},
+    {"method": "POST", "path": "/chat/stream"}
+  ],
+  "chat_request": {
+    "required": ["message"],
+    "optional": ["session_id", "model", "raw_events"]
+  },
+  "sse_events": [
+    "session",
+    "assistant.delta",
+    "tool.call",
+    "tool.result",
+    "usage",
+    "status",
+    "done",
+    "error"
+  ],
+  "session_rules": {
+    "model_binding": "The first request binds a session to its explicit model or the configured default.",
+    "model_conflict_status": 409,
+    "parallelism": "Requests in one session are serialized; independent sessions may run concurrently."
+  }
+}

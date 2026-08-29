@@ -16,3 +16,8 @@ workspace/
 
 # Local model routes may contain private endpoint identifiers.
 models.local.json
+
+# Deployment-only provider configuration and credentials.
+deploy/docker/.env
+deploy/docker/models.json
+deploy/docker/dsh-home/

@@ -1,138 +1,129 @@
 # dsh-as-a-service
 
-dsh-as-a-service is a small, local-first service layer for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It exposes isolated agent conversations through a stable HTTP API and Server-Sent Events (SSE).
+dsh-as-a-service turns a DeepSeek Harness agent into a persistent HTTP and SSE
+service. It is local-first today and organized for a later cloud, multi-tenant
+platform.
 
-It is intentionally a single-node foundation, not a hosted multi-tenant platform. The design keeps the boundaries needed for that direction: model aliases are allowlisted, each external session has persistent memory, a session remains bound to one model, and independent sessions can run concurrently.
+## Architecture
 
-## What is included
+    client
+      |
+      | HTTP and SSE contract
+      v
+    TypeScript Gateway (experimental control plane)
+      |
+      | unchanged HTTP and SSE forwarding
+      v
+    Python Worker (stable execution plane)
+      |
+      | official DeepSeek Harness Python SDK
+      v
+    bundled DSH JSON-RPC runtime
 
-- POST /chat for JSON request/response interaction
-- POST /chat/stream for SSE streaming
+The Worker is the only component that starts DSH, owns model selection, and
+persists conversation memory. The Gateway deliberately owns no agent memory;
+it is the future home for authentication, tenant routing, quotas, audit logs,
+and asynchronous job coordination.
+
+The SDK is Python, but the DSH runtime is a bundled target-native executable
+from the Node-based DSH ecosystem. Production containers do not need a separate
+Node installation. Node 22 is only needed to run the TypeScript Gateway.
+
+## Repository layout
+
+    protocol/                   Shared HTTP and SSE contract
+    implementations/python/     Stable DSH Worker
+    implementations/typescript/ Experimental HTTP and SSE Gateway
+    deploy/docker/              Python Worker Docker and Compose deployment
+
+## Protocol
+
+Both implementations preserve the protocol in protocol/http-contract.json:
+
 - GET /health and GET /models
-- Model alias allowlisting through models.json
-- Persistent conversation history across service restarts
-- Per-session serialization and configurable cross-session concurrency
-- DSH workspace-write sandbox policy, Todo, compaction, and optional DeepSeek web search
+- POST /chat for JSON responses
+- POST /chat/stream for Server-Sent Events
+- allowlisted model aliases
+- persistent session-to-model binding
+- per-session serialization and cross-session concurrency
 
-This repository deliberately does **not** include application Skills, model-generation adapters, media tooling, bot bridges, downloaded files, runtime state, or credentials. Those are deployment-specific extensions and should be integrated privately by each operator.
+When the first request uses a session ID, that session binds to the requested
+model or the configured default. Reusing it with a different model returns
+409 session_model_conflict.
 
-## Requirements
+## Python Worker: current stable implementation
 
-- Python 3.11 or newer
-- A DeepSeek Harness-compatible model provider
-- Node.js, as required by DeepSeek Harness runtime components
+The Worker uses the official deepseek-harness-sdk and the included DSH runtime.
+It provides session persistence, restart-safe conversation memory, model
+routing, workspace-write policy, Todo, compaction, and optional DeepSeek web
+search.
 
-The included default route uses a standard DeepSeek API key. For another provider or endpoint, edit models.json and configure the provider in your DSH settings.
+### Local start
 
-## Quick start
+    cd implementations/python
+    python3 -m venv .venv
+    .venv/bin/pip install -r requirements.txt
+    cp .env.example .env
+    # Edit .env and set DEEPSEEK_API_KEY.
+    ./start.sh
 
-~~~bash
-git clone https://github.com/YOUR_GITHUB_USER/dsh-as-a-service.git
-cd dsh-as-a-service
+    curl -sS http://127.0.0.1:8765/health
 
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env
-# Edit .env and set DEEPSEEK_API_KEY.
+The default models.json uses provider deepseek-official and model
+deepseek-chat. For another provider, edit models.json and place the matching
+provider configuration and credentials in DSH_HOME.
 
-./start.sh
-~~~
+### API examples
 
-The service listens on 127.0.0.1:8765 by default.
+    curl -sS http://127.0.0.1:8765/chat \
+      -H 'Content-Type: application/json' \
+      -d '{"session_id":"demo-1","message":"Explain the files in the workspace.","model":"deepseek"}'
 
-~~~bash
-curl -sS http://127.0.0.1:8765/health
-~~~
+    curl -N -sS http://127.0.0.1:8765/chat/stream \
+      -H 'Content-Type: application/json' \
+      -d '{"session_id":"demo-1","message":"Give me a brief status update."}'
 
-## API
+The stream can emit session, assistant.delta, tool.call, tool.result, usage,
+status, done, and error events. Consumers should treat done or error as a
+terminal event and accept unknown future event types.
 
-### List available models
+## TypeScript Gateway: experimental
 
-~~~bash
-curl -sS http://127.0.0.1:8765/models
-~~~
+The Gateway is a dependency-free Node 22 implementation. It validates the
+shared route set, forwards JSON bodies and status codes, and streams SSE without
+buffering it. It does not replace the Python Worker yet.
 
-The default models.json intentionally contains only the portable deepseek route:
+    cd implementations/typescript
+    DSH_WORKER_URL=http://127.0.0.1:8765 npm start
 
-~~~json
-{
-  "default": "deepseek",
-  "models": {
-    "deepseek": {
-      "provider": "deepseek",
-      "endpoint": "deepseek-chat"
-    }
-  }
-}
-~~~
+It listens on 127.0.0.1:8780 by default. See implementations/typescript/README.md.
 
-To expose multiple provider endpoints, add canonical aliases to models.json. Callers can select only configured aliases, never arbitrary endpoints or credentials.
+## Docker deployment
 
-### Non-streaming chat
+Docker first deploys only the stable Python Worker. See deploy/docker/README.md.
+The Compose stack binds the service to 127.0.0.1:8765 and keeps runtime state in
+a Docker volume. Account-specific endpoint routes and DSH credentials stay in
+deployment-only files ignored by Git.
 
-~~~bash
-curl -sS http://127.0.0.1:8765/chat -H 'Content-Type: application/json' -d '{"session_id":"demo-1","message":"Explain the files in the workspace.","model":"deepseek"}'
-~~~
+## Development checks
 
-Example response:
+    cd implementations/python
+    python -m unittest discover -s tests -v
 
-~~~json
-{
-  "session_id": "demo-1",
-  "model": "deepseek",
-  "answer": "...",
-  "finish_reason": "completed",
-  "elapsed_ms": 1234
-}
-~~~
-
-Reuse the same session_id to continue the conversation. The first request binds that session to its explicit model, or to the configured default. A later request that specifies another model returns 409 session_model_conflict; use a new session ID for a separate model context.
-
-### Streaming chat (SSE)
-
-~~~bash
-curl -N -sS http://127.0.0.1:8765/chat/stream -H 'Content-Type: application/json' -d '{"session_id":"demo-1","message":"Give me a brief status update."}'
-~~~
-
-The standard SSE event sequence includes:
-
-- session — external session ID and selected model
-- assistant.delta — generated text chunks
-- tool.call / tool.result — tool lifecycle notifications
-- usage / status — optional runtime status
-- done — final answer, finish reason, and elapsed time
-
-Pass raw_events: true only when debugging and you need the underlying DSH events.
-
-## Configuration
-
-Copy .env.example to .env. The following configuration is most useful in a local deployment:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| DEEPSEEK_API_KEY | — | Required for the default route. |
-| DSH_HTTP_HOST | 127.0.0.1 | Bind address. Keep loopback unless you add an authentication layer. |
-| DSH_HTTP_PORT | 8765 | Listen port. |
-| DSH_HTTP_MAX_PARALLEL_SESSIONS | 4 | Maximum concurrent sessions. Requests within one session are serialized. |
-| DSH_WORKSPACE | ./workspace | Agent filesystem workspace. |
-| DSH_SESSION_ROOT | ./state/sessions | DSH event/session storage. |
-| DSH_HTTP_CONVERSATION_ROOT | ./state/conversations | Restart-safe external conversation memory. |
-| DSH_HTTP_MODELS_CONFIG | ./models.json | Alternate model alias catalog. |
-
-state/, workspace/, .env, and models.local.json are ignored by Git. Do not commit credentials, downloaded content, runtime transcripts, or account-specific endpoint IDs.
+    cd ../typescript
+    npm test
 
 ## Security
 
-This service has **no HTTP authentication** and is intentionally bound to loopback by default. Do not expose it directly to untrusted networks.
+The Worker has no HTTP authentication and should remain loopback-only until it
+is behind an authenticated TLS reverse proxy. Workspace-write protects mutation
+scope, but it is not a tenant isolation boundary. Before public exposure, add
+authentication, authorization, quotas, audit logs, tenant-aware storage, and
+stronger sandboxing.
 
-The DSH agent uses workspace-write policy for filesystem mutation, but read and network capabilities are not a multi-tenant isolation boundary. Before putting this behind a public or shared endpoint, add authentication, tenant-aware storage, request limits, stronger sandboxing, observability, and policy enforcement appropriate for your environment.
-
-## Development
-
-~~~bash
-.venv/bin/python -m unittest discover -s tests -v
-~~~
+This repository contains no application Skills, media adapters, bot bridges,
+runtime state, credentials, or account-specific model endpoint IDs.
 
 ## License
 
-[MIT](LICENSE). DeepSeek Harness is used under its upstream license; see its repository for details.
+[MIT](LICENSE). DeepSeek Harness remains subject to its upstream license.

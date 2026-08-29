@@ -1,0 +1,14 @@
+{
+  "name": "@dsh-as-a-service/typescript-gateway",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Dependency-free TypeScript gateway for the dsh-as-a-service HTTP and SSE protocol.",
+  "scripts": {
+    "start": "node --experimental-strip-types src/server.ts",
+    "test": "node --experimental-strip-types --test tests/gateway.test.ts"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

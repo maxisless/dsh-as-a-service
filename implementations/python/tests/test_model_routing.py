@@ -12,7 +12,7 @@ import server
 class ModelCatalogTests(unittest.TestCase):
     def test_default_catalog_is_portable(self) -> None:
         self.assertEqual(server.CONFIG_DEFAULT_MODEL_ALIAS, "deepseek")
-        self.assertEqual(server.MODEL_ROUTES["deepseek"].provider, "deepseek")
+        self.assertEqual(server.MODEL_ROUTES["deepseek"].provider, "deepseek-official")
         self.assertEqual(server.MODEL_ROUTES["deepseek"].endpoint, "deepseek-chat")
         self.assertEqual(server.resolve_model_alias("deepseek"), "deepseek")
 

@@ -248,6 +248,7 @@ PKG_CACHE.mkdir(parents=True, exist_ok=True)
 RUNTIME_ENV = {
     "PKG_CACHE_PATH": str(PKG_CACHE),
     "DSH_HOME": str(DSH_HOME),
+    "DSH_CWD": str(WORKSPACE),
     "DSH_HTTP_PI_PROVIDERS_JSON": json.dumps(PI_PROVIDERS, separators=(",", ":")),
     "DSH_WORKSPACE": str(WORKSPACE),
     **RUNTIME_CREDENTIALS,

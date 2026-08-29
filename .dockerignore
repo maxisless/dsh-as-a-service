@@ -1,0 +1,15 @@
+.git/
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# Operator data must not enter a container build context.
+state/
+workspace/
+deploy/docker/.env
+deploy/docker/models.json

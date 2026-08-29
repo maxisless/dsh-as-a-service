@@ -1,6 +1,8 @@
 # The DSH SDK installs a target-native manylinux runtime wheel. Debian/glibc is
-# required; Alpine/musl is intentionally not used.
-FROM python:3.11-slim-bookworm
+# required; Alpine/musl is intentionally not used. DSH_BASE_IMAGE can point to
+# a compatible locally cached Debian or Ubuntu image in restricted networks.
+ARG BASE_IMAGE=python:3.11-slim-bookworm
+FROM ${BASE_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -11,14 +13,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DSH_SESSION_ROOT=/data/state/sessions \
     DSH_HTTP_CONVERSATION_ROOT=/data/state/conversations \
     PKG_CACHE_PATH=/data/state/pkg-cache \
-    DSH_HTTP_MODELS_CONFIG=/config/models.json
+    DSH_HTTP_MODELS_CONFIG=/config/models.json \
+    PATH=/opt/venv/bin:$PATH
 
 WORKDIR /app
 
-RUN groupadd --system --gid 10001 dsh \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends python3-venv ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/venv \
+    && groupadd --system --gid 10001 dsh \
     && useradd --system --uid 10001 --gid dsh --create-home dsh \
     && mkdir -p /data/workspace /data/state/sessions /data/state/conversations /data/state/pkg-cache /config \
-    && chown -R dsh:dsh /app /data /config
+    && chown -R dsh:dsh /app /data /config /opt/venv
 
 COPY implementations/python/requirements.txt ./requirements.txt
 RUN python -m pip install --upgrade pip \

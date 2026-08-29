@@ -22,6 +22,13 @@ For a provider configured through DSH pi-ai, put settings.yaml and, when needed,
 container user's DSH_HOME. Both the directory and its files should be readable
 only by the container user (uid 10001) on the host.
 
+## Restricted Docker networks
+
+The default base image is python:3.11-slim-bookworm. If a Docker host cannot
+reach Docker Hub but already has a compatible Debian or Ubuntu image, set
+DSH_BASE_IMAGE in .env to that local image tag. The Dockerfile installs a Python
+virtual environment and all Worker dependencies inside the image.
+
 ## Operations
 
     docker compose -f compose.yml ps

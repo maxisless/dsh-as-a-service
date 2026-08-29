@@ -3,6 +3,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
+      args:
+        BASE_IMAGE: ${DSH_BASE_IMAGE:-python:3.11-slim-bookworm}
     image: dsh-as-a-service-python:local
     init: true
     env_file:

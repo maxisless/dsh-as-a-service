@@ -23,3 +23,7 @@ deploy/docker/models.json
 deploy/docker/dsh-home/
 deploy/docker/wheelhouse/*
 !deploy/docker/wheelhouse/.gitkeep
+
+# Private server-local Compose overrides are combined with the public Compose
+# file at deployment time; they must never be committed.
+deploy/docker/compose.private*.yml

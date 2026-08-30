@@ -27,6 +27,7 @@ This repository is public source only. Never commit or copy into it:
 - private Skills, Feishu bridge code/configuration, or private Docker Compose overrides.
 
 On the server, private configuration and extension state remain outside this Git worktree. The public Compose file is combined at runtime with an untracked private override; the deployment timer updates only the tracked GitHub checkout and preserves that private layer.
+Private source code that needs deployment (such as a bot bridge or account-specific extension) belongs in a separate **private** GitHub repository and follows the same local-test → push → server-pull process. Only its secrets, runtime state, and deployment-only configuration remain server-local.
 
 ## Server deployment contract
 

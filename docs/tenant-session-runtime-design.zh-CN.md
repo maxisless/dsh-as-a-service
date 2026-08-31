@@ -99,11 +99,26 @@ flowchart LR
 | --- | --- | --- | --- |
 | 租户 | tenant_id | 策略、计费/配额、模型与 Skill 白名单、存储命名空间、审计保留规则 | 单一永久 Harness 或共享对话 |
 | 主体 | principal_id | 调用方身份及租户角色 | 任意租户或会话的访问权 |
-| 会话 | 服务端签发的 session_id | 模型绑定、对话记忆、DSH runtime session ID、workspace、会话锁 | 其他会话的文件或记忆 |
+| Agent / App | `agent_id` + 不可变 `agent_version` | 助手身份、系统指令、模型/Skill 策略、检索集合、工具策略、artifact 默认规则 | 租户成员、账单账户、原始凭据 |
+| 会话 | 绑定一个 Agent 版本的服务端签发 `session_id` | 模型绑定、对话记忆、DSH runtime session ID、workspace、会话锁 | 其他会话的文件或记忆 |
 | 运行 | 服务端签发的 run_id | 一次请求、事件流、输入清单、输出产物、生命周期状态 | 长期对话状态 |
 | runtime 租约 | 内部 runtime_id | 一个活跃 DSH Harness 子进程和兼容模型配置 | 租户归属或永久产物 |
 
-控制面从已认证调用方导出 tenant ID 与 principal ID。公开客户端不能自行指定裸 session ID 进而认领历史。飞书映射由服务端导出：私聊映射到用户会话，群聊映射到群会话，话题映射到话题会话。
+控制面从已认证调用方导出 tenant ID 与 principal ID。公开客户端不能自行指定裸 session ID 进而认领历史。飞书映射由服务端导出：私聊映射到用户会话，群聊映射到群会话，话题映射到话题会话。会话还记录 `agent_id` 与 `agent_version`；因此一个租户可以托管多个助手，且不会混合它们的 prompt、工具、知识或 artifact 策略。
+
+~~~mermaid
+flowchart TB
+    Tenant["租户<br/>身份 · 成员 · 账单 · Vault 命名空间"]
+    AgentA["Agent A v17<br/>销售助手<br/>知识：销售<br/>工具：报价"]
+    AgentB["Agent B v5<br/>研发助手<br/>知识：代码<br/>工具：代码与部署"]
+    SessionA["会话 A<br/>绑定 Agent A v17"]
+    SessionB["会话 B<br/>绑定 Agent B v5"]
+
+    Tenant --> AgentA
+    Tenant --> AgentB
+    AgentA --> SessionA
+    AgentB --> SessionB
+~~~
 
 ## 租户控制面
 
@@ -239,6 +254,97 @@ sequenceDiagram
 ~~~
 
 具体 REST 或 RPC 路径可以变化，但必须保留上述权限边界。特别是，租户管理员可管理租户内的全局资源；只有聊天权限的主体可创建或继续已授权会话，但不能发布配置、访问密钥，或在没有相应角色时提升共享记忆。
+
+## 持久化控制面与运行状态
+
+在 Worker 横向扩展之前，架构必须先具备持久化控制面。进程内 map、lock 和 queue 是 v1 有用的实现细节，但当存在多个 Worker 时，不能继续充当租户访问、会话串行、运行归属或投递状态的权威来源。
+
+~~~mermaid
+flowchart LR
+    API["API 与飞书入口"]
+    DB["控制面数据库<br/>权威元数据与状态"]
+    Q["持久化队列"]
+    EX["执行器池"]
+    OBJ["对象存储"]
+    IDX["知识索引"]
+    VAULT["Vault"]
+
+    API --> DB
+    API --> Q
+    DB --> Q
+    Q --> EX
+    EX --> DB
+    EX --> OBJ
+    EX --> IDX
+    DB --> VAULT
+~~~
+
+| 权威系统 | 权威内容 | 不能单独决定的事情 |
+| --- | --- | --- |
+| 控制面数据库 | tenant/principal/role、Agent version、session/run 状态、lease、幂等键、artifact ACL/元数据、policy/config 版本、用量账本 | 原始 artifact 字节、原始密钥值、向量相似度排序 |
+| 持久化队列 | 待执行运行、延迟重试、异步媒体/索引/清理 job | 授权、最终运行成功、artifact 访问权 |
+| 对象存储 | 附件、artifact、导出快照、记忆源文件 | 调用方是否有权读取对象 |
+| 知识索引 | 有范围的检索候选和 embedding | 可信策略或权威运行状态 |
+| Vault | 原始密钥值与轮换材料 | 会话归属、账单或执行历史 |
+
+每个运行都有持久化状态机和幂等键。最小状态路径如下：
+
+~~~text
+CREATED → QUEUED → LEASED → RUNNING → SUCCEEDED
+                             ├→ FAILED
+                             ├→ CANCELED
+                             └→ EXPIRED
+~~~
+
+lease 带有 `lease_epoch`、`executor_id`、过期时间和 attempt 编号。执行器只有持有当前 lease epoch 时才能更新运行；过期执行器不能覆盖已重试的运行。所有带副作用的操作使用由 tenant、run 和 action identity 派生的幂等键。外部 task ID、文档/消息 ID 和 artifact 投递 ID 都要在重试前持久化。
+
+~~~mermaid
+stateDiagram-v2
+    [*] --> CREATED
+    CREATED --> QUEUED
+    QUEUED --> LEASED
+    LEASED --> RUNNING
+    RUNNING --> SUCCEEDED
+    RUNNING --> FAILED
+    RUNNING --> CANCELED
+    LEASED --> QUEUED: 启动前 lease 过期
+    RUNNING --> QUEUED: 可重试失败 / 执行器丢失
+    QUEUED --> EXPIRED: 队列 TTL 到期
+~~~
+
+## 上下文信任边界
+
+授权检索并不等于文本可信。即使某段内容存储在租户授权集合中，prompt builder 也必须区分可信平台控制与不可信数据。
+
+~~~text
+可信控制指令
+  平台策略 → 已发布 Agent 版本 → 已解析运行策略
+
+不可信数据块
+  授权租户检索 → 用户消息/附件 → 网页内容 → 工具输出
+
+模型只能把数据块当作参考材料，不能把其当作修改策略、调用隐藏工具、泄露凭据
+或覆盖指令的授权。
+~~~
+
+每个检索 chunk 和外部附件都带 source、collection、revision、content type、trust class 与 access decision。文档未授权、过期、恶意或不属于 Agent 允许集合时，检索可以返回空结果。工具输出也遵循相同的不可信数据边界。
+
+## Artifact、事件与成本生命周期
+
+Artifact、事件流和成本需要各自独立的持久化契约：
+
+| 关注点 | 必需契约 |
+| --- | --- |
+| Artifact ACL | artifact 归属于 tenant + Agent + session + run；下载检查所有适用范围规则 |
+| Artifact 安全 | 校验大小/类型，扫描适用的上传/输出，加密静态存储，且不内联执行主动内容 |
+| 下载 | 签名 URL 有短 TTL；支持时绑定 audience；支持撤销检查并写审计事件 |
+| 保留/删除 | 租户策略级联 workspace、DSH state、artifact、记忆源/索引、Vault references 与备份；已删除租户不能在恢复时重新出现 |
+| SSE 恢复 | 每个事件有单调递增 `event_id`；Last-Event-ID 从持久化事件日志恢复；未知/过期 cursor 返回明确 resync 状态 |
+| 取消 | 客户端取消写入持久化 cancel intent；执行器/工具/媒体 job 确认取消或报告不可取消的外部工作 |
+| 预算 | dispatch 前预留估算成本，异步记录实际用量，对账有延迟的 provider 用量；策略预算耗尽后阻止新工作 |
+| 异步媒体 | 使用幂等键只提交一次 task，持久化 provider task ID，只轮询/投递一次，并与交互 token 用量分开计费 |
+
+运行进入终态本身不代表业务完成：artifact 登记与面向用户的投递都要各自拥有幂等完成记录。Worker 在 provider 成功但投递前崩溃时，应恢复投递，而不是重新生成 artifact。
 
 ## 存储布局
 
@@ -436,26 +542,29 @@ GET /v1/artifacts/{artifact_id}
 
 ### 阶段 1：建立服务端身份
 
-- 在控制面增加 tenant、principal、session、run 与 artifact 记录。
+- 在控制面增加 tenant、principal、Agent/App、不可变 Agent version、session、run、lease、幂等键与 artifact 记录。
+- 将控制面数据库、持久化队列、对象存储、知识索引和 Vault references 建立为独立的权威系统。
 - 新 API 之后先继续复用当前 Worker 作为可信单租户执行器。
 - 从飞书 sender、chat 与 thread 元数据导出飞书会话归属。
 
 ### 阶段 2：分离状态与产物
 
-- 将 conversation 和 DSH persistence 从进程全局根目录移动到 tenant/session 根目录。
+- 将 conversation 和 DSH persistence 从进程全局根目录移动到 tenant/Agent/session 根目录。
 - 将飞书入站媒体从共享 inbound 目录移到 workspace/inbox/<run-id>/。
 - 将输出文件登记为 artifact；保留现有异步媒体投递 worker，但让它从 artifact API 获取结果。
+- 构建可信上下文组装器以及显式的租户记忆提升/审核路径。
 
 ### 阶段 3：增加调度与配额
 
-- 将即时 429 busy 改成持久化 queue 状态和 SSE status 事件。
-- 落地会话串行、租户活跃运行上限、全局容量、超时与 artifact 保留规则。
+- 将即时 429 busy 改成持久化运行状态、lease、fencing、幂等 action 记录和 SSE status 事件。
+- 落地会话串行、租户活跃运行上限、全局容量、队列 TTL、取消、成本预留与 artifact 保留规则。
+- 增加 Last-Event-ID 恢复和恰好一次 artifact 投递记录。
 
 ### 阶段 4：隔离执行 Worker
 
 - 每份会话租约在容器或 pod 中执行，只挂载该会话 workspace 和 DSH state。
 - 增加执行器池容量和空闲回收。只有验证上游 session-scoped workspace 契约后，才升级为跨会话共享的 per-model DSH runtime pool。
-- 通过带凭据感知的 Model Gateway 调用模型。
+- 通过带凭据感知的 Model/Tool Gateway 调用模型和工具，签发带范围 capability，而非下发原始租户密钥。
 
 ### 阶段 5：加固与运营
 
@@ -468,6 +577,9 @@ GET /v1/artifacts/{artifact_id}
 
 1. 两个并发会话无法列出、读取、修改或返回彼此的附件与产物。
 2. 即使知道标识符，两个租户也不能解析彼此的会话、运行或 artifact。
-3. 多个会话可通过有界执行池并发执行，不发生跨会话 SSE 事件或记忆泄漏。
-4. Worker 重启后可恢复持久化队列和 artifact 投递状态，不重复产生用户可见结果。
-5. 可按 tenant、model、session 与 run 观测容量、公平性、成本、时延和失败。
+3. 同一租户的两个 Agent 不会混合各自已发布的 prompt、Skill、检索集合或 artifact 策略。
+4. 多个会话可通过有界执行器/runtime 池并发执行，不发生跨会话 SSE 事件、记忆泄漏或 workspace 可见性。
+5. Worker 重启后可恢复持久化队列、lease 和 artifact 投递状态，不重复产生用户可见结果或外部提交。
+6. 检索文档、附件、网页和工具输出保持不可信数据块，不能覆盖已发布控制指令。
+7. 无法从执行器 workspace、会话状态、prompt、artifact、日志或公开 API 响应恢复原始租户凭据。
+8. 可按 tenant、Agent、model、session 与 run 观测容量、公平性、预留/实际成本、时延、取消和失败。

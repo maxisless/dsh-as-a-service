@@ -105,11 +105,26 @@ flowchart LR
 | --- | --- | --- | --- |
 | Tenant | tenant_id | policy, billing/quota, model and Skill allowlists, storage namespace, audit retention | a permanent single Harness or a shared conversation |
 | Principal | principal_id | caller identity and tenant role | arbitrary tenant or session access |
-| Session | server-issued session_id | model binding, conversation memory, DSH runtime session ID, workspace, session lock | another session's files or memory |
+| Agent / App | `agent_id` + immutable `agent_version` | assistant identity, system instructions, model/Skill policy, retrieval collections, tool policy, artifact defaults | tenant membership, billing account, raw credentials |
+| Session | server-issued `session_id` bound to one Agent version | model binding, conversation memory, DSH runtime session ID, workspace, session lock | another session's files or memory |
 | Run | server-issued run_id | one request, event stream, input manifest, output artifacts, lifecycle status | long-term conversation state |
 | Runtime lease | internal runtime_id | one active DSH Harness subprocess and compatible model configuration | tenant ownership or persistent artifacts |
 
-The control plane derives tenant ID and principal ID from an authenticated caller. A public client cannot choose a raw session ID and thereby claim its history. Feishu mappings are server-derived: direct message to user conversation, group to group conversation, and thread to thread conversation.
+The control plane derives tenant ID and principal ID from an authenticated caller. A public client cannot choose a raw session ID and thereby claim its history. Feishu mappings are server-derived: direct message to user conversation, group to group conversation, and thread to thread conversation. A session also records `agent_id` and `agent_version`; a tenant can therefore host multiple assistants without mixing their prompts, tools, knowledge, or artifact policy.
+
+```mermaid
+flowchart TB
+    Tenant["Tenant<br/>identity · membership · billing · Vault namespace"]
+    AgentA["Agent A v17<br/>Sales assistant<br/>knowledge: sales<br/>tools: quote"]
+    AgentB["Agent B v5<br/>Engineering assistant<br/>knowledge: code<br/>tools: code and deploy"]
+    SessionA["Session A<br/>bound to Agent A v17"]
+    SessionB["Session B<br/>bound to Agent B v5"]
+
+    Tenant --> AgentA
+    Tenant --> AgentB
+    AgentA --> SessionA
+    AgentB --> SessionB
+```
 
 ## Tenant Control Plane
 
@@ -245,6 +260,97 @@ Execution administration
 ```
 
 The exact REST or RPC surface can change, but it must preserve these authority boundaries. In particular, a tenant administrator may manage global resources within the tenant, while a principal with only chat permission may create or continue authorized sessions but cannot publish configuration, access secrets, or promote shared memory without the relevant role.
+
+## Durable Control Plane and Run State
+
+The architecture needs a durable control plane before it can run on more than one Worker. In-process maps, locks, and queues are useful v1 implementation details, but they cannot be the authority for tenant access, session serialization, run ownership, or delivery state once Workers scale horizontally.
+
+```mermaid
+flowchart LR
+    API["API and Feishu ingress"]
+    DB["Control-plane database<br/>authoritative metadata and state"]
+    Q["Durable queue"]
+    EX["Executor pool"]
+    OBJ["Object storage"]
+    IDX["Knowledge index"]
+    VAULT["Vault"]
+
+    API --> DB
+    API --> Q
+    DB --> Q
+    Q --> EX
+    EX --> DB
+    EX --> OBJ
+    EX --> IDX
+    DB --> VAULT
+```
+
+| System of record | Authoritative content | Must not decide alone |
+| --- | --- | --- |
+| Control-plane database | tenant/principal/role, Agent version, session/run state, leases, idempotency keys, artifact ACL/metadata, policy/config versions, usage ledger | raw artifact bytes, raw secret values, vector similarity ranking |
+| Durable queue | pending execution, delayed retry, asynchronous media/index/cleanup jobs | authorization, final run success, artifact access |
+| Object storage | attachments, artifacts, exported snapshots, memory source files | whether a caller is authorized to read an object |
+| Knowledge index | scoped retrieval candidates and embeddings | trusted policy or source-of-truth run state |
+| Vault | raw secret values and rotation material | session ownership, billing, or execution history |
+
+Every run has a durable state machine and an idempotency key. The minimal state path is:
+
+```text
+CREATED → QUEUED → LEASED → RUNNING → SUCCEEDED
+                             ├→ FAILED
+                             ├→ CANCELED
+                             └→ EXPIRED
+```
+
+A lease carries `lease_epoch`, `executor_id`, expiry, and an attempt number. The executor may update a run only while it holds the current lease epoch; a stale executor cannot overwrite a retried run. Side-effecting actions use an idempotency key derived from tenant, run, and action identity. External task IDs, document/message IDs, and artifact delivery IDs are persisted before retrying.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CREATED
+    CREATED --> QUEUED
+    QUEUED --> LEASED
+    LEASED --> RUNNING
+    RUNNING --> SUCCEEDED
+    RUNNING --> FAILED
+    RUNNING --> CANCELED
+    LEASED --> QUEUED: lease expires before start
+    RUNNING --> QUEUED: retryable failure / executor lost
+    QUEUED --> EXPIRED: queue TTL reached
+```
+
+## Context Trust Boundary
+
+Authorization is not enough for retrieved text. The prompt builder must distinguish trusted platform control from untrusted data, even if that data is stored in an authorized tenant collection.
+
+```text
+trusted control instructions
+  platform policy → published Agent version → resolved run policy
+
+untrusted data blocks
+  authorized tenant retrieval → user message/attachment → web content → tool output
+
+The model receives data blocks as reference material, never as authority to
+change policy, invoke hidden tools, reveal credentials, or override instructions.
+```
+
+Every retrieved chunk and external attachment is labeled with source, collection, revision, content type, trust class, and access decision. Retrieval may return no result when a document is unauthorized, stale, malicious, or outside the Agent's allowed collections. Tool output follows the same untrusted-data boundary.
+
+## Artifact, Event, and Cost Lifecycle
+
+Artifacts, event streams, and costs need their own durable contracts:
+
+| Concern | Required contract |
+| --- | --- |
+| Artifact ACL | artifact belongs to tenant + Agent + session + run; download checks all applicable scope rules |
+| Artifact safety | validate size/type, scan applicable uploads/outputs, encrypt at rest, and never execute active content inline |
+| Download | signed URL has short TTL, audience binding when supported, revocation check, and audit event |
+| Retention/deletion | tenant policy cascades through workspace, DSH state, artifacts, memory sources/indexes, Vault references, and backups; deleted tenants must not reappear during restore |
+| SSE recovery | every event has monotonic `event_id`; `Last-Event-ID` resumes from durable event log; unknown/expired cursor yields explicit resync state |
+| Cancellation | client cancellation requests a durable cancel intent; executor/tool/media job acknowledges or reports non-cancelable external work |
+| Budget | reserve estimated cost before dispatch, record actual usage asynchronously, reconcile provider-delayed usage, and prevent new work once policy budget is exhausted |
+| Async media | submit task once with idempotency key, persist provider task ID, poll/deliver exactly once, and account separately from interactive token use |
+
+A terminal run is not sufficient by itself: artifact registration and user-visible delivery must each have idempotent completion records. A Worker crash after a provider succeeds but before delivery must resume delivery, not regenerate the artifact.
 
 ## Storage Layout
 
@@ -442,26 +548,29 @@ The control plane derives tenant and principal from credentials. It rejects a se
 
 ### Phase 1 — Establish server-owned identities
 
-- Add tenant, principal, session, run, and artifact records to the control plane.
+- Add tenant, principal, Agent/App, immutable Agent version, session, run, lease, idempotency, and artifact records to the control plane.
+- Establish the control-plane database, durable queue, object storage, knowledge index, and Vault references as separate systems of record.
 - Keep the current Worker as the trusted single-tenant executor behind the new API.
 - Derive Feishu session ownership from Feishu sender, chat, and thread metadata.
 
 ### Phase 2 — Separate state and artifacts
 
-- Move conversation records and DSH persistence from process-global roots into tenant/session roots.
+- Move conversation records and DSH persistence from process-global roots into tenant/Agent/session roots.
 - Move inbound Feishu media from the shared inbound directory to workspace/inbox/<run-id>/.
 - Register output files as artifacts; preserve the existing asynchronous media delivery worker behind the artifact API.
+- Build the trusted-context assembler and explicit tenant-memory promotion/review path.
 
 ### Phase 3 — Add scheduler and quotas
 
-- Replace immediate global 429 busy with persistent queue states and SSE status events.
-- Enforce session serialization, tenant active-run caps, global capacity, time limits, and artifact retention.
+- Replace immediate global 429 busy with durable run states, leases, fencing, idempotent action records, and SSE status events.
+- Enforce session serialization, tenant active-run caps, global capacity, queue TTL, cancellation, cost reservation, and artifact retention.
+- Add Last-Event-ID recovery and exactly-once artifact delivery records.
 
 ### Phase 4 — Isolated execution workers
 
 - Run each leased session in a container or pod with only its workspace and DSH state mounted.
 - Introduce executor-pool capacity and idle eviction. Promote this to a shared per-model DSH runtime pool only after validating a session-scoped workspace contract in upstream DSH.
-- Route model calls through a credential-aware Model Gateway.
+- Route model and tool calls through credential-aware Gateways that issue scoped capabilities rather than raw tenant secrets.
 
 ### Phase 5 — Harden and operate
 
@@ -474,6 +583,9 @@ The target design is complete when the following can be demonstrated:
 
 1. Two concurrent sessions cannot list, read, modify, or return each other's attachments or artifacts.
 2. Two tenants cannot resolve each other's sessions, runs, or artifacts even when they know the identifiers.
-3. Multiple sessions execute concurrently through a bounded runtime pool without cross-session SSE events or memory leakage.
-4. A restarted worker resumes durable queue and artifact-delivery state without duplicating user-visible results.
-5. Capacity, tenant fairness, cost, latency, and failures are measurable by tenant, model, session, and run.
+3. Two Agents in one tenant cannot mix their published prompts, Skills, retrieval collections, or artifact policy.
+4. Multiple sessions execute concurrently through a bounded executor/runtime pool without cross-session SSE events, memory leakage, or workspace visibility.
+5. A restarted worker resumes durable queue, lease, and artifact-delivery state without duplicating user-visible results or external submissions.
+6. Retrieved documents, attachments, web pages, and tool output remain untrusted data blocks and cannot override published control instructions.
+7. Raw tenant credentials cannot be recovered from an executor workspace, session state, prompt, artifact, log, or public API response.
+8. Capacity, tenant fairness, reserved/actual cost, latency, cancellation, and failures are measurable by tenant, Agent, model, session, and run.

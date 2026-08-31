@@ -126,8 +126,10 @@ This repository contains no application Skills, media adapters, bot bridges,
 runtime state, credentials, or account-specific model endpoint IDs.
 
 For the target hosted architecture—tenant policy boundaries, session-scoped
-files and memory, reusable DSH runtime pools, artifacts, and scheduling—see
-[Tenant, Session, and Runtime Design](docs/tenant-session-runtime-design.md).
+files and memory, reusable DSH runtime pools, artifacts, and scheduling—see:
+
+- [Tenant, Session, and Runtime Design (English)](docs/tenant-session-runtime-design.md)
+- [租户、会话与运行时设计（中文）](docs/tenant-session-runtime-design.zh-CN.md)
 
 ## License
 

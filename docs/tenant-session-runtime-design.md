@@ -1,5 +1,7 @@
 # Tenant, Session, and Runtime Design
 
+[中文版本](tenant-session-runtime-design.zh-CN.md)
+
 > **Status: target architecture.** This document defines the desired hosted,
 > multi-tenant end state. It does not claim that the current v1 Worker already
 > implements these boundaries, and it leaves the runtime-reuse mechanism open
@@ -28,6 +30,34 @@ Tenant
 
 This preserves lightweight, multiplexed DSH runtime sessions while removing the shared-workspace boundary.
 
+```mermaid
+flowchart TB
+    T["Tenant<br/>policy · quota · model and Skill allowlist"]
+    P["Principal<br/>authenticated caller"]
+    S1["Session A<br/>conversation · workspace · artifacts"]
+    S2["Session B<br/>conversation · workspace · artifacts"]
+    R1["Run A-1"]
+    R2["Run B-1"]
+    X["Isolated executor lease"]
+    H["Compatible DSH Harness / runtime capacity"]
+
+    T --> P
+    T --> S1
+    T --> S2
+    P -->|authorized access| S1
+    P -->|authorized access| S2
+    S1 --> R1
+    S2 --> R2
+    R1 --> X
+    R2 --> X
+    X -. compatible model capacity .-> H
+```
+
+**Reading the diagram:** the tenant governs access and quota; the session owns
+state and files; a run is one request; an executor lease supplies isolated
+execution. Runtime capacity is reusable only after the executor boundary is in
+place.
+
 ## Why This Is the Target
 
 One DSH Harness owns a long-lived JSON-RPC runtime subprocess. The SDK can send multiple session prompts through that subprocess, separates JSON-RPC responses by request ID, and filters streamed notifications by DSH session ID. A runtime session is therefore much cheaper than a runtime subprocess and can be concurrent.
@@ -53,6 +83,21 @@ Current Worker
 - server.py:667 assigns a distinct DSH runtime session ID to each model-alias and public-session pair.
 
 The shared workspace means two independent sessions can still read or overwrite the same file. The workspace-write sandbox prevents writes outside the workspace, but it does not distinguish two sessions inside it.
+
+```mermaid
+flowchart LR
+    subgraph Current["Current v1 Worker"]
+      A1["Session A"] --> W1["/data/workspace"]
+      B1["Session B"] --> W1
+      W1 --> F["report.md · inbound/ · artifacts"]
+    end
+    subgraph Target["Target execution boundary"]
+      A2["Session A"] --> WA["tenant A / session A / workspace"]
+      B2["Session B"] --> WB["tenant A / session B / workspace"]
+      WA --> FA["inbox/run A · artifacts/run A"]
+      WB --> FB["inbox/run B · artifacts/run B"]
+    end
+```
 
 ## Final Ownership Model
 
@@ -84,6 +129,19 @@ tenants/<tenant-id>/
 
 Attachments and generated files are registered as artifacts. A response carries an artifact ID or signed download URL, never an arbitrary shared-workspace path. Retention and deletion are tenant policy decisions.
 
+```mermaid
+flowchart TD
+    Tenant["tenant_id"]
+    Tenant --> Session["session_id"]
+    Session --> Memory["conversation.json"]
+    Session --> DSH["DSH state and checkpoints"]
+    Session --> Workspace["workspace"]
+    Workspace --> Inbox["inbox/run_id"]
+    Workspace --> Output["artifacts/run_id"]
+    Output --> Registry["artifact registry"]
+    Registry --> Client["authorized download or delivery"]
+```
+
 ## Execution Model
 
 The control plane schedules a run only after it resolves the tenant, principal, session, and bound model.
@@ -106,6 +164,27 @@ The control plane schedules a run only after it resolves the tenant, principal, 
 ~~~
 
 The same session is always serial. Different sessions may run concurrently, subject to tenant and global quotas. Long-running media jobs become asynchronous artifact jobs after submission; they do not occupy an interactive DSH runtime lease while the provider renders media.
+
+```mermaid
+sequenceDiagram
+    participant C as Client or Feishu
+    participant CP as Control plane
+    participant Q as Scheduler and queue
+    participant E as Isolated executor
+    participant D as DSH runtime
+    participant A as Artifact store
+
+    C->>CP: authenticated message and attachments
+    CP->>CP: authorize tenant and principal
+    CP->>Q: create run_id, enqueue
+    Q-->>C: queued or running over SSE
+    Q->>E: lease session workspace and DSH state
+    E->>D: prompt bound runtime session
+    D-->>E: deltas and tool events
+    E-->>C: stream status and deltas
+    E->>A: register generated files
+    E-->>C: done plus artifact references
+```
 
 ## Runtime Pool and Execution Isolation
 
@@ -134,6 +213,16 @@ The final invariant is **session-isolated execution**, not a mandatory shared-ru
 | Isolated session executor pool | DSH keeps process-wide cwd or other process-wide tool state | Pool capacity is reusable, but each active session receives its own process/container lease |
 
 The second path is safe with the current SDK. It does not mean one permanent Harness per session: the process/container is created or leased for an active session, then stopped and recycled after idle expiry. The first path becomes preferable only after a verified upstream session-workspace contract exists.
+
+```mermaid
+flowchart LR
+    S["Session-isolated execution<br/>non-negotiable invariant"]
+    S --> U{"Does upstream DSH support<br/>session-scoped workspace and state?"}
+    U -->|yes, verified| P["Session-aware runtime pool<br/>shared compatible runtime capacity"]
+    U -->|no or uncertain| I["Isolated session executor pool<br/>one active process/container lease per session"]
+    P --> G["Same tenant/session/run security guarantees"]
+    I --> G
+```
 
 ## Isolation Choices
 
@@ -168,6 +257,21 @@ The current deployment has a global active-turn limit of 10. The target keeps a 
 | Media render | asynchronous job after submit | does not hold an interactive slot |
 
 This prevents one noisy tenant from consuming all capacity and lets a client observe queued work through SSE instead of retrying after a 429 response.
+
+```mermaid
+flowchart TB
+    In["Incoming run"]
+    In --> Same{"Same session active?"}
+    Same -->|yes| SQ["Session FIFO queue"]
+    Same -->|no| Tenant{"Tenant active-run quota reached?"}
+    Tenant -->|yes| TQ["Tenant queue"]
+    Tenant -->|no| Global{"Global capacity available?"}
+    Global -->|yes| Lease["Lease executor capacity"]
+    Global -->|no| GQ["Global bounded queue"]
+    SQ --> Global
+    TQ --> Global
+    GQ --> Lease
+```
 
 ## External API Direction
 

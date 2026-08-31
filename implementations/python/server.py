@@ -745,6 +745,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path.startswith("/internal/artifacts/") and path.endswith("/download"):
+            self.download_internal_artifact(path)
+            return
         if path.startswith("/internal/artifacts/"):
             self.get_internal_artifact(path)
             return
@@ -919,28 +922,57 @@ class Handler(BaseHTTPRequestHandler):
             artifact_id = path.removeprefix("/internal/artifacts/")
             if not artifact_id or "/" in artifact_id:
                 raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
-            # The bridge runs under the server's trusted delivery boundary. It
-            # receives only an artifact record, never a tenant credential.
-            with CONTROL_PLANE.transaction() as connection:
-                row = connection.execute("SELECT * FROM artifacts WHERE id = ? AND status = 'READY'", (artifact_id,)).fetchone()
-            if row is None:
-                raise ControlPlaneError("artifact_not_found", "Artifact was not found")
-            artifact = {key: row[key] for key in row.keys()}
-            session = CONTROL_PLANE.get_session(LOCAL_IDENTITY, str(row["session_id"]))
-            artifact_file(artifact, session)
+            artifact, _session, _location = self.internal_artifact(artifact_id)
             self.send_json(HTTPStatus.OK, {
-                "artifact_id": str(row["id"]),
-                "type": str(row["kind"]),
-                "name": str(row["name"]),
-                "storage_key": str(row["storage_key"]),
-                "session_id": str(row["session_id"]),
-                "run_id": str(row["run_id"]),
-                "content_type": row["content_type"],
+                "artifact_id": str(artifact["id"]),
+                "type": str(artifact["kind"]),
+                "name": str(artifact["name"]),
+                "session_id": str(artifact["session_id"]),
+                "run_id": str(artifact["run_id"]),
+                "content_type": artifact["content_type"],
             })
         except ControlPlaneError as exc:
             self.send_error_json(control_error_status(exc), exc.code, exc.message)
         except ApiError as exc:
             self.send_error_json(exc.status, exc.code, exc.message)
+
+    def internal_artifact(self, artifact_id: str) -> tuple[dict[str, Any], SessionRecord, Path]:
+        """Resolve a bridge-downloadable artifact without disclosing its path."""
+        with CONTROL_PLANE.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM artifacts WHERE id = ? AND status = 'READY'", (artifact_id,),
+            ).fetchone()
+        if row is None:
+            raise ControlPlaneError("artifact_not_found", "Artifact was not found")
+        artifact = {key: row[key] for key in row.keys()}
+        session = CONTROL_PLANE.get_session(LOCAL_IDENTITY, str(artifact["session_id"]))
+        return artifact, session, artifact_file(artifact, session)
+
+    def download_internal_artifact(self, path: str) -> None:
+        try:
+            self.read_internal_request()
+            artifact_id = path.removeprefix("/internal/artifacts/").removesuffix("/download")
+            if not artifact_id or "/" in artifact_id:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
+            artifact, _session, location = self.internal_artifact(artifact_id)
+            self.send_artifact_file(artifact, location)
+        except ControlPlaneError as exc:
+            self.send_error_json(control_error_status(exc), exc.code, exc.message)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+
+    def send_artifact_file(self, artifact: dict[str, Any], location: Path) -> None:
+        size = location.stat().st_size
+        content_type = str(artifact.get("content_type") or mimetypes.guess_type(location.name)[0] or "application/octet-stream")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        filename = json.dumps(str(artifact["name"]))
+        self.send_header("Content-Disposition", f"attachment; filename={filename}")
+        self.send_header("Cache-Control", "private, no-store")
+        self.end_headers()
+        with location.open("rb") as handle:
+            shutil.copyfileobj(handle, self.wfile)
 
     def create_control_session(self) -> None:
         try:
@@ -1047,17 +1079,7 @@ class Handler(BaseHTTPRequestHandler):
             artifact = CONTROL_PLANE.get_artifact(request.identity, artifact_id)
             session = CONTROL_PLANE.get_session(request.identity, str(artifact["session_id"]))
             location = artifact_file(artifact, session)
-            size = location.stat().st_size
-            content_type = str(artifact.get("content_type") or mimetypes.guess_type(location.name)[0] or "application/octet-stream")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(size))
-            filename = json.dumps(str(artifact["name"]))
-            self.send_header("Content-Disposition", f"attachment; filename={filename}")
-            self.send_header("Cache-Control", "private, no-store")
-            self.end_headers()
-            with location.open("rb") as handle:
-                shutil.copyfileobj(handle, self.wfile)
+            self.send_artifact_file(artifact, location)
             CONTROL_PLANE.append_audit(request.identity.tenant_id, "artifact.download", {"artifact_id": artifact_id}, principal_id=request.identity.principal_id, run_id=str(artifact["run_id"]))
         except ControlPlaneError as exc:
             self.send_error_json(control_error_status(exc), exc.code, exc.message)

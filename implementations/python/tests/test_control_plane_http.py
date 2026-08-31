@@ -221,6 +221,22 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "text/plain")
         self.assertEqual(body, b"artifact")
 
+        internal_headers = {"X-DSH-Internal-Token": "internal-test-token"}
+        status, _, raw = self.request(
+            "GET", f"/internal/artifacts/{artifact['artifact_id']}", headers=internal_headers,
+        )
+        self.assertEqual(status, 200)
+        internal_metadata = json.loads(raw)
+        self.assertNotIn("storage_key", internal_metadata)
+        self.assertEqual(internal_metadata["name"], "test.txt")
+
+        status, headers, body = self.request(
+            "GET", f"/internal/artifacts/{artifact['artifact_id']}/download", headers=internal_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/plain")
+        self.assertEqual(body, b"artifact")
+
     def test_stream_done_returns_registered_artifacts_without_server_path(self) -> None:
         with patch.object(server, "ARTIFACT_RESULT_TYPES", frozenset({"private.result"})):
             status, headers, raw = self.request(

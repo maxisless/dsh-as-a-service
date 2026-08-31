@@ -382,7 +382,7 @@ def make_harness(
         max_tokens=MAX_TOKENS,
         cwd=str(workspace),
         session_root=str(session_root),
-        cordis=str(BASE_DIR / "cordis.yml"),
+        cordis=str(CORDIS_CONFIG),
         env=runtime_env,
         request_timeout_seconds=RUNTIME_REQUEST_TIMEOUT_SECONDS,
     )
@@ -883,7 +883,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ControlPlaneError("artifact_not_found", "Artifact was not found")
             self.send_json(HTTPStatus.OK, {
                 "artifact_id": str(row["id"]),
-                "type": str(row["name"]).rsplit(".", 1)[-1] if "." in str(row["name"]) else "file",
+                "type": str(row["kind"]),
                 "name": str(row["name"]),
                 "storage_key": str(row["storage_key"]),
                 "session_id": str(row["session_id"]),

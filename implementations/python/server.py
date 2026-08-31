@@ -453,7 +453,7 @@ def close_runtime() -> None:
 def control_error_status(error: ControlPlaneError) -> HTTPStatus:
     if error.code in {"forbidden"}:
         return HTTPStatus.FORBIDDEN
-    if error.code in {"session_not_found", "run_not_found", "agent_not_found"}:
+    if error.code in {"session_not_found", "run_not_found", "agent_not_found", "artifact_not_found"}:
         return HTTPStatus.NOT_FOUND
     if error.code in {"session_model_conflict", "agent_version_exists", "session_busy", "run_not_claimable"}:
         return HTTPStatus.CONFLICT
@@ -463,7 +463,6 @@ def control_error_status(error: ControlPlaneError) -> HTTPStatus:
 
 
 def session_payload(session: SessionRecord) -> dict[str, Any]:
-    paths = CONTROL_PLANE.ensure_session_storage(session)
     return {
         "session_id": session.id,
         "tenant_id": session.tenant_id,
@@ -472,9 +471,14 @@ def session_payload(session: SessionRecord) -> dict[str, Any]:
         "agent_version": session.agent_version,
         "model": session.model_alias,
         "status": session.status,
-        "workspace": str(paths.workspace),
         "created_at": session.created_at,
     }
+
+
+def internal_session_payload(session: SessionRecord) -> dict[str, Any]:
+    """Trusted bridge view; never use this on a public /v1 response."""
+    paths = CONTROL_PLANE.ensure_session_storage(session)
+    return {**session_payload(session), "workspace": str(paths.workspace)}
 
 
 def run_payload(run: RunRecord) -> dict[str, Any]:
@@ -495,6 +499,44 @@ def run_payload(run: RunRecord) -> dict[str, Any]:
         **({"response": run.response} if run.response is not None else {}),
         **({"error": run.error} if run.error is not None else {}),
     }
+
+
+def run_artifacts(run: RunRecord) -> list[dict[str, Any]]:
+    """Return only the registered, transport-safe artifact metadata."""
+    response = run.response
+    artifacts = response.get("artifacts") if isinstance(response, dict) else None
+    return artifacts if isinstance(artifacts, list) else []
+
+
+def artifact_file(artifact: dict[str, Any], session: SessionRecord) -> Path:
+    """Resolve and validate a registered artifact before reading it."""
+    root = CONTROL_PLANE.ensure_session_storage(session).artifacts.resolve()
+    raw_location = Path(str(artifact["storage_key"]))
+    if not path_is_safe_regular_file(raw_location, root):
+        raise ControlPlaneError("artifact_not_found", "Artifact was not found")
+    location = raw_location.resolve()
+    size = location.stat().st_size
+    if size < 1 or size > ARTIFACT_MAX_BYTES:
+        raise ControlPlaneError("artifact_not_found", "Artifact was not available")
+    return location
+
+
+def path_is_safe_regular_file(candidate: Path, root: Path) -> bool:
+    """Require a regular file below root with no symlinked path component."""
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return False
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return False
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return False
+    return root in resolved.parents and candidate.is_file()
 
 
 def normalize_session_events(notification: Notification, *, raw_events: bool = False) -> list[tuple[str, dict[str, Any]]]:
@@ -562,9 +604,10 @@ def materialize_run_artifacts(run: RunRecord, session: SessionRecord, events: li
         pure_path = PurePosixPath(raw_path)
         if pure_path.is_absolute() or ".." in pure_path.parts or not pure_path.parts:
             continue
-        source = (workspace / Path(*pure_path.parts)).resolve()
-        if workspace not in source.parents or not source.is_file() or source.is_symlink():
+        source = workspace / Path(*pure_path.parts)
+        if not path_is_safe_regular_file(source, workspace):
             continue
+        source = source.resolve()
         size = source.stat().st_size
         if size < 1 or size > ARTIFACT_MAX_BYTES:
             continue
@@ -795,6 +838,7 @@ class Handler(BaseHTTPRequestHandler):
                 "answer": result.final_response,
                 "finish_reason": result.finish_reason,
                 "run_id": final_run.id,
+                "artifacts": run_artifacts(final_run),
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000),
                 **({"error": error} if error is not None else {}),
             }
@@ -850,7 +894,7 @@ class Handler(BaseHTTPRequestHandler):
                 LOCAL_IDENTITY, session_id, model_alias=resolve_model_alias(model) if model is not None else None,
             )
             CONTROL_PLANE.import_legacy_conversation(session, conversation_path(session.id))
-            self.send_json(HTTPStatus.OK, session_payload(session))
+            self.send_json(HTTPStatus.OK, internal_session_payload(session))
         except ControlPlaneError as exc:
             self.send_error_json(control_error_status(exc), exc.code, exc.message)
         except ApiError as exc:
@@ -881,6 +925,9 @@ class Handler(BaseHTTPRequestHandler):
                 row = connection.execute("SELECT * FROM artifacts WHERE id = ? AND status = 'READY'", (artifact_id,)).fetchone()
             if row is None:
                 raise ControlPlaneError("artifact_not_found", "Artifact was not found")
+            artifact = {key: row[key] for key in row.keys()}
+            session = CONTROL_PLANE.get_session(LOCAL_IDENTITY, str(row["session_id"]))
+            artifact_file(artifact, session)
             self.send_json(HTTPStatus.OK, {
                 "artifact_id": str(row["id"]),
                 "type": str(row["kind"]),
@@ -998,14 +1045,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
             request = self.read_control_request(require_body=False)
             artifact = CONTROL_PLANE.get_artifact(request.identity, artifact_id)
-            location = Path(str(artifact["storage_key"])).resolve()
             session = CONTROL_PLANE.get_session(request.identity, str(artifact["session_id"]))
-            root = CONTROL_PLANE.ensure_session_storage(session).artifacts.resolve()
-            if root not in location.parents or not location.is_file():
-                raise ControlPlaneError("artifact_not_found", "Artifact was not found")
+            location = artifact_file(artifact, session)
             size = location.stat().st_size
-            if size < 1 or size > ARTIFACT_MAX_BYTES:
-                raise ControlPlaneError("artifact_not_found", "Artifact was not available")
             content_type = str(artifact.get("content_type") or mimetypes.guess_type(location.name)[0] or "application/octet-stream")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
@@ -1144,6 +1186,7 @@ class Handler(BaseHTTPRequestHandler):
                     "run_id": run.id,
                     "answer": result.final_response,
                     "finish_reason": result.finish_reason,
+                    "artifacts": run_artifacts(final_run),
                     "elapsed_ms": round((time.monotonic() - started_at) * 1000),
                     **({"error": error} if error is not None else {}),
                 }))

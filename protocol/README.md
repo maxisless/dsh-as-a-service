@@ -43,6 +43,9 @@ substitute for production OAuth/API-key management or a Vault.
 - `POST /v1/runs/{run_id}/cancel` records cancellation intent. The current DSH
   SDK cannot forcibly interrupt an in-flight prompt, so it reaches a durable
   terminal boundary before acknowledging cancellation.
+- `GET /v1/artifacts/{artifact_id}` downloads a completed artifact after the
+  same tenant/principal authorization check. Run responses expose artifact IDs
+  and metadata, never server filesystem paths.
 
 The Worker now gives every control-plane session a distinct workspace, DSH
 session state root, conversation file, and Harness instance. This is the safe

@@ -64,6 +64,8 @@ sessions, immutable Agent versions, durable runs, idempotency keys, lease epochs
 SSE event replay, cancellation intent, and artifact metadata/access control. See
 [the protocol notes](protocol/README.md) for the exact preview routes and
 deployment environment variables.
+Run responses contain opaque artifact IDs and metadata; downloadable artifact
+bytes require the authorized artifact endpoint and never expose a server path.
 
 This is a deliberately scoped foundation, not the entire hosted platform. The
 default store is local SQLite; a production multi-node deployment still needs a

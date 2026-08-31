@@ -40,6 +40,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(session.agent_version, "v1")
         self.assertTrue(paths.workspace.is_dir())
         self.assertTrue(paths.dsh_state.is_dir())
+        self.assertNotIn(paths.workspace, paths.artifacts.parents)
         self.assertNotIn("acme", str(paths.root))
         self.assertNotIn(session.id, str(paths.root))
 

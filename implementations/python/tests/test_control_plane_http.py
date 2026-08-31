@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -27,7 +28,22 @@ class FakeHarness:
     def run(self, prompt: str, *, session_id: str, on_notification=None):
         if on_notification is not None:
             on_notification(server.Notification(method="session.status", payload={"sessionId": session_id, "status": "working"}))
-        return type("Result", (), {"final_response": "control-plane-ok", "finish_reason": "completed", "events": []})()
+        events: list[dict[str, object]] = []
+        if prompt == "artifact":
+            output = Path(str(self.kwargs["cwd"])) / "outputs" / "test.txt"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("artifact", encoding="utf-8")
+            events = [{
+                "type": "tool/result",
+                "data": {"message": {"content": [{
+                    "type": "tool-result", "isError": False,
+                    "content": [{"type": "text", "text": json.dumps({
+                        "ok": True, "type": "private.result",
+                        "artifacts": [{"kind": "file", "path": "outputs/test.txt"}],
+                    })}],
+                }]}}
+            }]
+        return type("Result", (), {"final_response": "control-plane-ok", "finish_reason": "completed", "events": events})()
 
 
 class WorkerControlPlaneHttpTests(unittest.TestCase):
@@ -36,11 +52,13 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
         self.control = ControlPlane(Path(self.directory.name) / "control", default_model="deepseek")
         self.server_patch = patch.object(server, "CONTROL_PLANE", self.control)
         self.token_patch = patch.object(server, "CONTROL_PLANE_TOKEN", "test-token")
+        self.internal_token_patch = patch.object(server, "INTERNAL_BRIDGE_TOKEN", "internal-test-token")
         self.key_patch = patch.object(server, "API_KEY_CONFIGURED", True)
         self.harness_patch = patch.object(server, "DeepSeekHarness", FakeHarness)
         self.scheduler_patch = patch.object(server, "ensure_scheduler", lambda: None)
         self.server_patch.start()
         self.token_patch.start()
+        self.internal_token_patch.start()
         self.key_patch.start()
         self.harness_patch.start()
         self.scheduler_patch.start()
@@ -59,6 +77,7 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
         self.harness_patch.stop()
         self.scheduler_patch.stop()
         self.key_patch.stop()
+        self.internal_token_patch.stop()
         self.token_patch.stop()
         self.server_patch.stop()
         server._model_runtimes.clear()
@@ -87,7 +106,10 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
         self.assertEqual(status, 201)
         session = json.loads(raw)
         self.assertTrue(session["session_id"].startswith("s_"))
-        self.assertTrue(Path(session["workspace"]).is_dir())
+        # Public responses never disclose server filesystem topology.
+        self.assertNotIn("workspace", session)
+        stored_session = self.control.get_session(server.LOCAL_IDENTITY, session["session_id"])
+        self.assertTrue(self.control.ensure_session_storage(stored_session).workspace.is_dir())
 
         status, _, raw = self.request(
             "POST",
@@ -163,6 +185,77 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
         self.assertTrue(paths.workspace.is_dir())
         self.assertTrue(paths.conversation.is_file())
         self.assertNotIn(str(server.WORKSPACE), str(paths.workspace))
+
+    def test_internal_session_resolve_is_token_protected_and_exposes_only_bridge_workspace(self) -> None:
+        status, _, raw = self.request(
+            "POST", "/internal/sessions/resolve", {"session_id": "bridge-demo"},
+            {"X-DSH-Internal-Token": "internal-test-token"},
+        )
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertTrue(Path(payload["workspace"]).is_dir())
+        status, _, raw = self.request(
+            "POST", "/internal/sessions/resolve", {"session_id": "bridge-demo"},
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(raw)["error"]["code"], "unauthorized")
+
+    def test_compat_chat_returns_registered_artifacts_without_server_path(self) -> None:
+        with patch.object(server, "ARTIFACT_RESULT_TYPES", frozenset({"private.result"})):
+            status, _, raw = self.request(
+                "POST", "/chat", {"session_id": "artifact-demo", "message": "artifact"},
+            )
+        self.assertEqual(status, 200)
+        response = json.loads(raw)
+        self.assertEqual(len(response["artifacts"]), 1)
+        artifact = response["artifacts"][0]
+        self.assertEqual(artifact["type"], "file")
+        self.assertNotIn("path", artifact)
+        self.assertNotIn("storage_key", artifact)
+
+        status, headers, body = self.request(
+            "GET", f"/v1/artifacts/{artifact['artifact_id']}",
+            headers={"Authorization": "Bearer test-token"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/plain")
+        self.assertEqual(body, b"artifact")
+
+    def test_stream_done_returns_registered_artifacts_without_server_path(self) -> None:
+        with patch.object(server, "ARTIFACT_RESULT_TYPES", frozenset({"private.result"})):
+            status, headers, raw = self.request(
+                "POST", "/chat/stream", {"session_id": "stream-artifact-demo", "message": "artifact"},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream; charset=utf-8")
+        frames = raw.decode("utf-8").split("\n\n")
+        done = next(frame for frame in frames if "event: done" in frame)
+        data_line = next(line for line in done.splitlines() if line.startswith("data: "))
+        payload = json.loads(data_line.removeprefix("data: "))
+        self.assertEqual(len(payload["artifacts"]), 1)
+        self.assertNotIn("path", payload["artifacts"][0])
+
+    def test_artifact_materialization_rejects_symlink_even_when_target_is_in_workspace(self) -> None:
+        session = self.control.create_session(server.LOCAL_IDENTITY)
+        run, _ = self.control.create_run(server.LOCAL_IDENTITY, session, message="artifact")
+        workspace = self.control.ensure_session_storage(session).workspace
+        target = workspace / "target.txt"
+        target.write_text("artifact", encoding="utf-8")
+        output = workspace / "outputs" / "linked.txt"
+        output.parent.mkdir(parents=True)
+        os.symlink(target, output)
+        events = [{
+            "type": "tool/result",
+            "data": {"message": {"content": [{
+                "type": "tool-result", "isError": False,
+                "content": [{"type": "text", "text": json.dumps({
+                    "ok": True, "type": "private.result",
+                    "artifacts": [{"kind": "file", "path": "outputs/linked.txt"}],
+                })}],
+            }]}}
+        }]
+        with patch.object(server, "ARTIFACT_RESULT_TYPES", frozenset({"private.result"})):
+            self.assertEqual(server.materialize_run_artifacts(run, session, events), [])
 
     def test_artifact_materialization_requires_declared_result_type_and_workspace_path(self) -> None:
         session = self.control.create_session(server.LOCAL_IDENTITY)

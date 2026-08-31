@@ -539,7 +539,11 @@ class ControlPlane:
             workspace=root / "workspace",
             dsh_state=root / "dsh-state",
             conversation=root / "conversation.json",
-            artifacts=root / "workspace" / "artifacts",
+            # Artifacts are deliberately outside the agent-writable workspace.
+            # A completed artifact is copied here before it is registered, so a
+            # later tool call in the same session cannot silently alter what an
+            # artifact ID refers to.
+            artifacts=root / "artifacts",
         )
 
     def ensure_session_storage(self, session: SessionRecord) -> SessionPaths:
@@ -816,9 +820,12 @@ class ControlPlane:
                  size_bytes, storage_key, now),
             )
         return {
-            "artifact_id": artifact_id, "type": kind, "path": storage_key,
+            # storage_key is an internal filesystem implementation detail.  It
+            # must not reach a client or a bridge through a run response.
+            "artifact_id": artifact_id, "type": kind, "name": name,
             "session_id": run.session_id, "run_id": run.id,
             **({"size": str(size_bytes)} if size_bytes is not None else {}),
+            **({"content_type": content_type} if content_type else {}),
         }
 
     def get_artifact(self, identity: Identity, artifact_id: str) -> dict[str, Any]:

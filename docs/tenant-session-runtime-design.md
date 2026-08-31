@@ -111,6 +111,141 @@ flowchart LR
 
 The control plane derives tenant ID and principal ID from an authenticated caller. A public client cannot choose a raw session ID and thereby claim its history. Feishu mappings are server-derived: direct message to user conversation, group to group conversation, and thread to thread conversation.
 
+## Tenant Control Plane
+
+Tenant-level resources are first-class control-plane records. Sessions consume published tenant resources by reference; they do not copy secrets or mutable global configuration into conversation memory or a workspace.
+
+```mermaid
+flowchart TB
+    Tenant["Tenant control plane"]
+    Policy["Policy and quota<br/>models · Skills · network · retention"]
+    Config["Versioned configuration<br/>published tenant config version"]
+    Memory["Tenant memory and knowledge<br/>curated facts · documents · retrieval index"]
+    Vault["Tenant vault<br/>secret references only"]
+    Audit["Audit and usage<br/>immutable events · billing dimensions"]
+    Session["Session<br/>private conversation and workspace"]
+    Executor["Isolated executor"]
+    Gateway["Model and tool gateways"]
+
+    Tenant --> Policy
+    Tenant --> Config
+    Tenant --> Memory
+    Tenant --> Vault
+    Tenant --> Audit
+    Policy --> Session
+    Config --> Session
+    Memory -->|authorized retrieval only| Executor
+    Session --> Executor
+    Vault -->|short-lived scoped capability| Gateway
+    Executor -->|capability reference only| Gateway
+    Executor --> Audit
+```
+
+### Tenant memory and knowledge
+
+Tenant memory is shared knowledge owned by the tenant, not a concatenation of all user conversations. Store curated, attributable records such as approved instructions, organization facts, project documents, tool outputs promoted by a policy, and retrieval indexes. Each memory item has an owner, source, access scope, revision, retention policy, and provenance.
+
+```text
+Tenant memory                  Session memory
+───────────────────────────    ─────────────────────────────────
+shared by authorized users     private to one session
+curated or explicitly promoted raw multi-turn conversation
+versioned and attributable     bounded rolling context
+retrieved by policy             injected only into its own session
+```
+
+A run receives only retrieval results it is authorized to use. It must not mount or dump the tenant memory store into the workspace. Promotion from session or run output into tenant memory is an explicit, audited action; automatic promotion is disabled by default.
+
+### Configuration inheritance
+
+Configuration is immutable once published. A run stores the resolved version identifiers so it remains reproducible after the tenant changes a model policy or Skill setting.
+
+```text
+platform baseline
+  → tenant published configuration version
+    → session binding and narrow audited override
+      → run resolved configuration snapshot
+```
+
+The tenant configuration may include allowed model aliases, default model, enabled Skill versions, retrieval collections, outbound network policy, artifact retention, rate limits, cost budgets, and media defaults. A session may select a permitted model when created, but cannot weaken tenant policy or change its bound model afterward. A run records the exact policy/configuration/Skill versions used.
+
+### Secret and credential management
+
+Secrets are owned by a tenant Vault, but a session or executor never reads raw long-lived values. Persist only a secret reference and metadata such as purpose, provider, rotation state, permitted models/tools, and expiry policy.
+
+```text
+Tenant Vault
+  secret_ref: vault://tenant/t-123/model-provider/primary
+       │
+       ├─ Control plane verifies tenant policy and run intent
+       ├─ Model/Tool Gateway issues a short-lived, scoped capability
+       └─ Executor uses the capability for the approved request only
+
+Never expose to executor workspace, session memory, prompt, artifact, logs,
+or client response: raw API key, refresh token, vault master key
+```
+
+The control plane supports both tenant-supplied credentials and platform-managed credentials. In both cases, billing, authorization, rotation, revocation, and audit stay at the control-plane/gateway boundary. An executor receives the least-privilege capability necessary for one model or tool request, not a general tenant credential.
+
+### Management lifecycle and permissions
+
+Tenant global resources are managed through the control plane, not through agent tools. A tenant administrator can create drafts, upload sources, request rotation, or publish a reviewed version. An executor can read only the resolved configuration, authorized retrieval results, and short-lived capabilities for its assigned run. It cannot modify tenant configuration, write tenant memory directly, enumerate secrets, or rotate credentials.
+
+```mermaid
+sequenceDiagram
+    participant Admin as Tenant administrator
+    participant CP as Control plane
+    participant V as Tenant Vault
+    participant M as Tenant memory service
+    participant S as Session / run
+    participant E as Isolated executor
+
+    Admin->>CP: create config draft or policy change
+    CP->>CP: validate schema, quota, model/Skill policy
+    Admin->>CP: publish configuration version
+    CP-->>S: pin config_version at session/run creation
+    Admin->>V: write or rotate secret value
+    V-->>CP: store secret_ref and version metadata only
+    Admin->>M: ingest or approve tenant knowledge
+    M-->>CP: publish indexed memory revision
+    S->>CP: start run with pinned versions
+    CP->>E: resolved config + authorized retrieval + scoped capability
+    E-->>CP: append audit, usage, artifact metadata
+```
+
+| Global resource | Lifecycle and management | Executor visibility | Non-negotiable boundary |
+| --- | --- | --- | --- |
+| Tenant profile and membership | Control-plane CRUD, role assignment, suspension, deletion workflow | tenant ID and effective role only | executor cannot create members or expand its tenant scope |
+| Policy, quota, and network egress | draft → validation → immutable published version | resolved policy snapshot | run cannot loosen limits or edit policy |
+| Model and Skill configuration | allowlist, default model, pinned Skill bundle versions, media defaults | approved model/Skill IDs and configuration snapshot | no arbitrary model endpoint or Skill upload from a run |
+| Tenant memory and knowledge | ingest → extract/index → review or approval → published revision → retention/delete | scoped retrieval results only | no raw store mount; no implicit promotion from chat history |
+| Secret reference | create/rotate/revoke in Vault; version metadata in control plane | one short-lived capability for an approved call | no raw secret in prompt, workspace, DSH state, logs, artifact, or API response |
+| Audit and usage | append-only event and usage ledger; retention/export policy | no direct mutation | a run can append events only through the control plane |
+
+A configuration publish is atomic: it either produces one new immutable tenant configuration version or changes nothing. Session creation pins the permitted model and effective configuration version. Run creation additionally records the policy version, Skill bundle versions, memory collection revisions, and secret-reference versions used for that run.
+
+### Tenant management API direction
+
+The final control plane should expose management resources separately from run execution. Representative operations are:
+
+```text
+Tenant administration
+  manage tenant profile, membership, roles, policy drafts, quota, and published config versions
+
+Memory administration
+  ingest source → index → review/publish → scope retrieval → expire/delete
+  explicit promote(session/run artifact) → review/publish; never automatic by default
+
+Credential administration
+  create secret reference → write/rotate value in Vault → revoke → audit access
+  execution path uses capability issuance; it never returns the raw value
+
+Execution administration
+  install/pin approved Skill bundle → choose model allowlist → inspect run/audit/usage → cancel or retain artifacts
+```
+
+The exact REST or RPC surface can change, but it must preserve these authority boundaries. In particular, a tenant administrator may manage global resources within the tenant, while a principal with only chat permission may create or continue authorized sessions but cannot publish configuration, access secrets, or promote shared memory without the relevant role.
+
 ## Storage Layout
 
 Every session receives a dedicated root below the tenant namespace. Directory names use server-generated opaque IDs or hashes; raw user-controlled strings never become paths.

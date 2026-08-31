@@ -35,6 +35,7 @@ Node installation. Node 22 is only needed to run the TypeScript Gateway.
     implementations/python/     Stable DSH Worker
     implementations/typescript/ Experimental HTTP and SSE Gateway
     deploy/docker/              Python Worker Docker and Compose deployment
+    docs/                       Architecture and hosted-platform design notes
 
 ## Protocol
 
@@ -123,6 +124,10 @@ stronger sandboxing.
 
 This repository contains no application Skills, media adapters, bot bridges,
 runtime state, credentials, or account-specific model endpoint IDs.
+
+For the target hosted architecture—tenant policy boundaries, session-scoped
+files and memory, reusable DSH runtime pools, artifacts, and scheduling—see
+[Tenant, Session, and Runtime Design](docs/tenant-session-runtime-design.md).
 
 ## License
 

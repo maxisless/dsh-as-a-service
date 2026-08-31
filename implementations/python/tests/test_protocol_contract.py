@@ -16,7 +16,11 @@ class ProtocolContractTests(unittest.TestCase):
         )
 
         for route in contract["routes"]:
-            self.assertIn(route["path"], source)
+            # Parameterized routes are matched by prefix/suffix in the Worker,
+            # while fixed routes appear verbatim.
+            path = route["path"]
+            static_prefix = path.split("{", 1)[0]
+            self.assertIn(static_prefix or path, source)
 
     def test_contract_keeps_the_stream_terminal_events(self) -> None:
         repository_root = Path(__file__).resolve().parents[3]

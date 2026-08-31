@@ -9,7 +9,7 @@ type Contract = { version: string; routes: ContractRoute[] };
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const contractPath = path.resolve(sourceDirectory, "../../../protocol/http-contract.json");
 const contract = JSON.parse(readFileSync(contractPath, "utf8")) as Contract;
-const allowedRoutes = new Set(contract.routes.map((route) => route.method + " " + route.path));
+const allowedRoutes = contract.routes;
 const defaultWorkerUrl = "http://127.0.0.1:8765";
 const maxBodyBytes = 1024 * 1024;
 
@@ -59,6 +59,14 @@ function copyResponseHeaders(upstream: Response, response: ServerResponse): void
   response.writeHead(upstream.status, headers);
 }
 
+function routeMatches(method: string, pathname: string): boolean {
+  return allowedRoutes.some((route) => {
+    if (route.method !== method) return false;
+    const expression = "^" + route.path.replace(/\{[^}]+\}/g, "[^/]+") + "$";
+    return new RegExp(expression).test(pathname);
+  });
+}
+
 async function writeUpstreamBody(upstream: Response, response: ServerResponse): Promise<void> {
   if (upstream.body === null) {
     response.end();
@@ -86,8 +94,7 @@ async function proxyRequest(
 ): Promise<void> {
   const method = request.method ?? "GET";
   const requestUrl = new URL(request.url ?? "/", "http://gateway.local");
-  const routeKey = method + " " + requestUrl.pathname;
-  if (!allowedRoutes.has(routeKey)) {
+  if (!routeMatches(method, requestUrl.pathname)) {
     writeJson(response, 404, { ok: false, error: { code: "not_found", message: "Unknown endpoint" } });
     return;
   }
@@ -96,6 +103,10 @@ async function proxyRequest(
   const headers = new Headers();
   const contentType = request.headers["content-type"];
   if (typeof contentType === "string") headers.set("content-type", contentType);
+  for (const name of ["authorization", "idempotency-key", "last-event-id"]) {
+    const value = request.headers[name];
+    if (typeof value === "string") headers.set(name, value);
+  }
   const target = new URL(requestUrl.pathname + requestUrl.search, workerUrl).toString();
   const controller = new AbortController();
   request.once("aborted", () => controller.abort());

@@ -13,6 +13,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DSH_WORKSPACE=/data/workspace \
     DSH_SESSION_ROOT=/data/state/sessions \
     DSH_HTTP_CONVERSATION_ROOT=/data/state/conversations \
+    DSH_CONTROL_PLANE_ROOT=/data/state/control-plane \
     PKG_CACHE_PATH=/data/state/pkg-cache \
     DSH_HTTP_MODELS_CONFIG=/config/models.json \
     PATH=/opt/venv/bin:$PATH
@@ -25,7 +26,7 @@ RUN apt-get update \
     && python3 -m venv /opt/venv \
     && groupadd --system --gid 10001 dsh \
     && useradd --system --uid 10001 --gid dsh --create-home dsh \
-    && mkdir -p /data/workspace /data/state/sessions /data/state/conversations /data/state/pkg-cache /config \
+    && mkdir -p /data/workspace /data/state/sessions /data/state/conversations /data/state/control-plane /data/state/pkg-cache /config \
     && chown -R dsh:dsh /app /data /config /opt/venv
 
 COPY implementations/python/requirements.txt ./requirements.txt
@@ -36,7 +37,7 @@ RUN if find /wheelhouse -type f -name '*.whl' -print -quit | grep -q .; then \
       python -m pip install --requirement requirements.txt; \
     fi
 
-COPY --chown=dsh:dsh implementations/python/server.py implementations/python/cordis.yml ./
+COPY --chown=dsh:dsh implementations/python/server.py implementations/python/control_plane.py implementations/python/cordis.yml ./
 COPY --chown=dsh:dsh implementations/python/models.json /config/models.json
 
 USER dsh

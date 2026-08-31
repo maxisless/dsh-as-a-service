@@ -17,6 +17,24 @@ const worker = createServer(async (request, response) => {
     response.end(JSON.stringify({ ok: true, received: JSON.parse(body) }));
     return;
   }
+  if (request.method === "POST" && request.url === "/v1/sessions/demo/runs") {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({
+      received: JSON.parse(body),
+      authorization: request.headers.authorization,
+      idempotency: request.headers["idempotency-key"]
+    }));
+    return;
+  }
+  if (request.method === "POST" && request.url === "/v1/agents") {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ received: JSON.parse(body), authorization: request.headers.authorization }));
+    return;
+  }
   if (request.method === "POST" && request.url === "/chat/stream") {
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write("event: session\ndata: {\\\"session_id\\\":\\\"demo\\\"}\n\n");
@@ -69,4 +87,33 @@ test("forwards SSE frames", async () => {
   assert.equal(response.headers.get("content-type"), "text/event-stream");
   assert.match(text, /event: session/);
   assert.match(text, /event: done/);
+});
+
+test("forwards control-plane parameter routes and identity headers", async () => {
+  const response = await fetch("http://127.0.0.1:19002/v1/sessions/demo/runs", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: "Bearer test-token",
+      "idempotency-key": "message-1"
+    },
+    body: JSON.stringify({ message: "hello" })
+  });
+  const value = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(value.received.message, "hello");
+  assert.equal(value.authorization, "Bearer test-token");
+  assert.equal(value.idempotency, "message-1");
+});
+
+test("forwards Agent publication route", async () => {
+  const response = await fetch("http://127.0.0.1:19002/v1/agents", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer test-token" },
+    body: JSON.stringify({ agent_id: "sales", version: "v1", default_model: "deepseek" })
+  });
+  const value = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(value.received.agent_id, "sales");
+  assert.equal(value.authorization, "Bearer test-token");
 });

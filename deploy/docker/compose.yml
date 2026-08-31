@@ -15,6 +15,7 @@ services:
       DSH_WORKSPACE: /data/workspace
       DSH_SESSION_ROOT: /data/state/sessions
       DSH_HTTP_CONVERSATION_ROOT: /data/state/conversations
+      DSH_CONTROL_PLANE_ROOT: /data/state/control-plane
       PKG_CACHE_PATH: /data/state/pkg-cache
       DSH_HTTP_MODELS_CONFIG: /config/models.json
       DSH_HOME: /home/dsh/.dsh

@@ -137,6 +137,18 @@ class RuntimeRoutingTests(unittest.TestCase):
 
         self.assertEqual(server._model_runtimes["deepseek"].harness.start_calls, 1)
 
+    def test_each_control_session_gets_an_isolated_harness_and_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "CONTROL_PLANE", server.ControlPlane(Path(directory), default_model="deepseek")), patch.object(server, "DeepSeekHarness", self.FakeHarness):
+            identity = server.Identity("local", "local", "admin")
+            first_session = server.CONTROL_PLANE.create_session(identity)
+            second_session = server.CONTROL_PLANE.create_session(identity)
+            first = server.get_model_runtime("deepseek", first_session)
+            second = server.get_model_runtime("deepseek", second_session)
+
+        self.assertIsNot(first, second)
+        self.assertNotEqual(first.harness.kwargs["cwd"], second.harness.kwargs["cwd"])
+        self.assertNotEqual(first.harness.kwargs["session_root"], second.harness.kwargs["session_root"])
+
 
 class RequestModelTests(unittest.TestCase):
     def setUp(self) -> None:

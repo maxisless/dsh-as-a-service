@@ -52,6 +52,25 @@ When the first request uses a session ID, that session binds to the requested
 model or the configured default. Reusing it with a different model returns
 409 session_model_conflict.
 
+## Durable control-plane foundation
+
+The stable Worker now includes a SQLite-backed, single-node control-plane
+foundation. Existing loopback `/chat` and `/chat/stream` callers remain
+compatible, but their sessions are migrated into server-owned session records
+with separate conversation, DSH-state, workspace, and artifact directories.
+
+When `DSH_CONTROL_PLANE_TOKEN` is configured, `/v1` endpoints add server-issued
+sessions, immutable Agent versions, durable runs, idempotency keys, lease epochs,
+SSE event replay, cancellation intent, and artifact metadata/access control. See
+[the protocol notes](protocol/README.md) for the exact preview routes and
+deployment environment variables.
+
+This is a deliberately scoped foundation, not the entire hosted platform. The
+default store is local SQLite; a production multi-node deployment still needs a
+shared database/queue, an external Vault, a Model/Tool Gateway, and an isolated
+executor pool. The Worker does not accept raw tenant model/media credentials
+through `/v1`, and all current provider credentials remain server-local.
+
 ## Python Worker: current stable implementation
 
 The Worker uses the official deepseek-harness-sdk and the included DSH runtime.
@@ -105,6 +124,11 @@ Docker first deploys only the stable Python Worker. See deploy/docker/README.md.
 The Compose stack binds the service to 127.0.0.1:8765 and keeps runtime state in
 a Docker volume. Account-specific endpoint routes and DSH credentials stay in
 deployment-only files ignored by Git.
+
+For the control-plane foundation, the same volume also stores a `control-plane/`
+SQLite database and opaque tenant/session roots. Do not delete that directory
+when rebuilding a Worker unless intentionally removing its sessions, runs, and
+artifact metadata.
 
 ## Development checks
 

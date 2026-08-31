@@ -4,7 +4,13 @@
     {"method": "GET", "path": "/health"},
     {"method": "GET", "path": "/models"},
     {"method": "POST", "path": "/chat"},
-    {"method": "POST", "path": "/chat/stream"}
+    {"method": "POST", "path": "/chat/stream"},
+    {"method": "POST", "path": "/v1/agents"},
+    {"method": "POST", "path": "/v1/sessions"},
+    {"method": "POST", "path": "/v1/sessions/{session_id}/runs"},
+    {"method": "GET", "path": "/v1/runs/{run_id}"},
+    {"method": "GET", "path": "/v1/runs/{run_id}/events"},
+    {"method": "POST", "path": "/v1/runs/{run_id}/cancel"}
   ],
   "chat_request": {
     "required": ["message"],
@@ -24,5 +30,11 @@
     "model_binding": "The first request binds a session to its explicit model or the configured default.",
     "model_conflict_status": 409,
     "parallelism": "Requests in one session are serialized; independent sessions may run concurrently."
+  },
+  "control_plane_v1": {
+    "authentication": "Disabled unless a server-side control-plane token is configured.",
+    "sessions": "The server issues session IDs and binds each to tenant, principal, Agent version, and model.",
+    "runs": "Runs are durable, idempotent per tenant/idempotency key, and expose queued/leased/running/terminal state.",
+    "events": "SSE events have monotonically increasing IDs and support Last-Event-ID replay."
   }
 }

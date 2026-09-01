@@ -156,6 +156,8 @@ files and memory, reusable DSH runtime pools, artifacts, and scheduling—see:
 
 - [Tenant, Session, and Runtime Design (English)](docs/tenant-session-runtime-design.md)
 - [租户、会话与运行时设计（中文）](docs/tenant-session-runtime-design.zh-CN.md)
+- [Hosted Platform Backlog](docs/hosted-platform-backlog.md)
+- [托管平台待办清单](docs/hosted-platform-backlog.zh-CN.md)
 
 ## License
 

@@ -2,6 +2,8 @@
 
 [English version](tenant-session-runtime-design.md)
 
+剩余实施项见：[托管平台待办清单](hosted-platform-backlog.zh-CN.md)。
+
 > **状态：目标架构。** 本文描述托管、多租户平台的最终形态；它不表示当前 v1 Worker 已经具备这些边界。运行时复用的具体机制须以验证上游 DSH 是否支持会话级 workspace 为准。
 
 ## 一句话决策

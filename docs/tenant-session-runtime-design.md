@@ -2,6 +2,8 @@
 
 [中文版本](tenant-session-runtime-design.zh-CN.md)
 
+For remaining implementation work, see the [Hosted Platform Backlog](hosted-platform-backlog.md).
+
 > **Status: target architecture.** This document defines the desired hosted,
 > multi-tenant end state. It does not claim that the current v1 Worker already
 > implements these boundaries, and it leaves the runtime-reuse mechanism open

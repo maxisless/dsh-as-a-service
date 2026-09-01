@@ -302,6 +302,11 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
             finalized = json.loads(raw)
             self.assertEqual(finalized["status"], "QUEUED")
             self.assertEqual(finalized["input_manifest_status"], "FINALIZED")
+            prepared_run = self.control.get_run_for_internal_bridge(prepared["run_id"])
+            claimed = self.control.claim_run(prepared_run.id, "test-executor", lease_seconds=30)
+            running = self.control.mark_running(claimed, "test-executor", lease_seconds=30)
+            self.control.append_event(running.id, "assistant.delta", {"text": "done"})
+            self.control.finish_run(running, "test-executor", status="SUCCEEDED", response={"answer": "done", "artifacts": []})
             status, response_headers, stream = self.request(
                 "POST", f"/internal/runs/{prepared['run_id']}/stream", {}, headers,
             )

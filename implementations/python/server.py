@@ -1677,67 +1677,34 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def stream_internal_run(self, path: str) -> None:
-        """Stream a prepared Feishu Run without creating a second run record."""
+        """Execute or attach to one prepared Feishu Run's durable event stream."""
         try:
             self.read_internal_request()
             run_id = path.removeprefix("/internal/runs/").removesuffix("/stream")
             if not run_id or "/" in run_id:
                 raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
             run = CONTROL_PLANE.get_run_for_internal_bridge(run_id)
-            if run.source != "feishu" or run.status != "QUEUED" or run.input_manifest_status != "FINALIZED":
+            if run.source != "feishu" or run.input_manifest_status != "FINALIZED":
                 raise ApiError(HTTPStatus.CONFLICT, "run_not_ready", "Run is not ready for execution")
             session = CONTROL_PLANE.session_for_run(run)
-            if not _slots.acquire(blocking=False):
-                raise ApiError(HTTPStatus.TOO_MANY_REQUESTS, "busy", "Too many sessions are running")
-            try:
-                claimed = CONTROL_PLANE.claim_run(run.id, EXECUTOR_ID, lease_seconds=RUN_LEASE_SECONDS)
-            except BaseException:
-                _slots.release()
-                raise
-            started_at = time.monotonic()
-            stream: queue.Queue[tuple[str, dict[str, Any]] | BaseException | None] = queue.Queue()
-
-            def on_notification(notification: Notification) -> None:
-                for event_name, data in sse_events_for_notification(notification):
-                    CONTROL_PLANE.append_event(claimed.id, event_name, data)
-                    stream.put((event_name, data))
-
-            def worker() -> None:
-                try:
-                    final_run, result = execute_run_with_lease(claimed, session, on_notification=on_notification)
-                    stream.put(("done", {
-                        "session_id": session.id, "model": session.model_alias, "run_id": claimed.id,
-                        "answer": result.final_response, "finish_reason": result.finish_reason,
-                        "artifacts": run_artifacts(final_run),
-                        "elapsed_ms": round((time.monotonic() - started_at) * 1000),
-                        **({"error": final_run.error} if final_run.error is not None else {}),
-                    }))
-                except BaseException as exc:
-                    fail_run_best_effort(claimed, exc)
-                    stream.put(exc)
-                finally:
-                    stream.put(None)
-                    _slots.release()
-
+            ensure_scheduler()
+            _scheduler_wakeup.set()
             self.start_sse_response()
-            self.write_sse("session", {"session_id": session.id, "model": session.model_alias, "run_id": claimed.id})
-            _executor.submit(worker)
+            self.write_sse("session", {"session_id": session.id, "model": session.model_alias, "run_id": run.id})
+            last_event_id = 0
+            deadline = time.monotonic() + RUNTIME_REQUEST_TIMEOUT_SECONDS
             while True:
-                try:
-                    item = stream.get(timeout=15)
-                except queue.Empty:
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
-                    continue
-                if item is None:
+                events = CONTROL_PLANE.events_after(identity_for_session(session), run.id, last_event_id)
+                for event in events:
+                    last_event_id = event["event_id"]
+                    self._write_sse(event["event"], event["data"], event_id=last_event_id)
+                current = CONTROL_PLANE.get_run_for_internal_bridge(run.id)
+                if current.status in {"SUCCEEDED", "FAILED", "CANCELED", "EXPIRED"}:
                     break
-                if isinstance(item, BaseException):
-                    request_id = uuid.uuid4().hex
-                    print(f"[{request_id}] internal run stream failed: {type(item).__name__}: {item}", flush=True)
-                    self.write_sse("error", {"code": "agent_error", "message": f"Agent execution failed; request_id={request_id}"})
-                    continue
-                event_name, data = item
-                self.write_sse(event_name, data)
+                if time.monotonic() >= deadline:
+                    self.write_sse("error", {"code": "stream_timeout", "message": "Run stream timed out; reconnect to replay durable events"})
+                    break
+                time.sleep(0.2)
         except ControlPlaneError as exc:
             self.send_error_json(control_error_status(exc), exc.code, exc.message)
         except ApiError as exc:

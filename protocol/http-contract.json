@@ -11,7 +11,8 @@
     {"method": "GET", "path": "/v1/runs/{run_id}"},
     {"method": "GET", "path": "/v1/runs/{run_id}/events"},
     {"method": "POST", "path": "/v1/runs/{run_id}/cancel"},
-    {"method": "GET", "path": "/v1/artifacts/{artifact_id}"}
+    {"method": "GET", "path": "/v1/artifacts/{artifact_id}"},
+    {"method": "GET", "path": "/v1/operations/summary"}
   ],
   "chat_request": {
     "required": ["message"],

@@ -54,6 +54,8 @@ RUN_LEASE_SECONDS = float(os.environ.get("DSH_RUN_LEASE_SECONDS", "300"))
 RUN_EVENT_STREAM_SECONDS = float(os.environ.get("DSH_RUN_EVENT_STREAM_SECONDS", "60"))
 ARTIFACT_RESULT_TYPES_JSON = os.environ.get("DSH_ARTIFACT_RESULT_TYPES_JSON", "[]")
 ARTIFACT_MAX_BYTES = int(os.environ.get("DSH_ARTIFACT_MAX_BYTES", str(20 * 1024 * 1024)))
+RUN_INPUT_MAX_ITEMS = int(os.environ.get("DSH_RUN_INPUT_MAX_ITEMS", "12"))
+RUN_INPUT_MAX_BYTES = int(os.environ.get("DSH_RUN_INPUT_MAX_BYTES", str(512 * 1024 * 1024)))
 MAX_TOKENS = int(os.environ["DSH_MAX_TOKENS"]) if os.environ.get("DSH_MAX_TOKENS") else None
 MAX_BODY_BYTES = int(os.environ.get("DSH_HTTP_MAX_BODY_BYTES", str(1 * 1024 * 1024)))
 MAX_PARALLEL_SESSIONS = int(os.environ.get("DSH_HTTP_MAX_PARALLEL_SESSIONS", "4"))
@@ -96,6 +98,19 @@ class ChatRequest:
 class ControlRequest:
     identity: Identity
     body: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PendingRunInput:
+    kind: str
+    name: str
+    content_type: str | None
+    size_bytes: int
+    sha256: str
+    staged_path: Path
+    source_type: str
+    source_ref: str | None
+    requested_workspace_path: str | None
 
 
 class ApiError(Exception):
@@ -481,6 +496,39 @@ def internal_session_payload(session: SessionRecord) -> dict[str, Any]:
     return {**session_payload(session), "workspace": str(paths.workspace)}
 
 
+def identity_for_session(session: SessionRecord) -> Identity:
+    """Use the session's stored owner for trusted bridge-side control-plane work."""
+    return Identity(session.tenant_id, session.principal_id, "chat")
+
+
+def run_input_payload(record: Any) -> dict[str, Any]:
+    return {
+        "input_id": record.id,
+        "kind": record.kind,
+        "name": record.name,
+        "content_type": record.content_type,
+        "size_bytes": record.size_bytes,
+        "sha256": record.sha256,
+        "workspace_path": record.workspace_path,
+        "source_type": record.source_type,
+    }
+
+
+def delivery_payload(record: Any) -> dict[str, Any]:
+    return {
+        "delivery_id": record.id,
+        "run_id": record.run_id,
+        "artifact_id": record.artifact_id,
+        "destination_type": record.destination_type,
+        "destination_ref": record.destination_ref,
+        "status": record.status,
+        "attempts": record.attempts,
+        "provider_delivery_ref": record.provider_delivery_ref,
+        "last_error": record.last_error,
+        "payload": record.payload,
+    }
+
+
 def run_payload(run: RunRecord) -> dict[str, Any]:
     return {
         "run_id": run.id,
@@ -493,12 +541,78 @@ def run_payload(run: RunRecord) -> dict[str, Any]:
         "attempt": run.attempt,
         "lease_epoch": run.lease_epoch,
         "cancel_requested": run.cancel_requested,
+        "input_manifest_status": run.input_manifest_status,
         "created_at": run.created_at,
         "started_at": run.started_at,
         "finished_at": run.finished_at,
         **({"response": run.response} if run.response is not None else {}),
         **({"error": run.error} if run.error is not None else {}),
     }
+
+
+def materialize_run_inputs(run: RunRecord, session: SessionRecord, inputs: list[PendingRunInput]) -> list[dict[str, Any]]:
+    """Copy trusted ingress files into an immutable per-run inbox manifest."""
+    if not inputs:
+        return []
+    paths = CONTROL_PLANE.ensure_session_storage(session)
+    inbox = (paths.workspace / "inbox" / run.id).resolve()
+    inbox.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(inbox, 0o700)
+    except OSError:
+        pass
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in inputs:
+        if item.kind not in {"image", "audio", "video", "file"} or not item.name or Path(item.name).name != item.name:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_input", "Run input metadata is invalid")
+        if item.sha256 in seen:
+            continue
+        seen.add(item.sha256)
+        source = item.staged_path.resolve()
+        if not source.is_file() or source.is_symlink() or source.stat().st_size != item.size_bytes:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_input", "Run input file changed before submission")
+        digest = hashlib.sha256()
+        with source.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if not hmac.compare_digest(digest.hexdigest(), item.sha256):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_input", "Run input digest changed before submission")
+        destination = (inbox / f"{item.sha256[:16]}-{item.name}").resolve()
+        if inbox not in destination.parents:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_input", "Run input destination is invalid")
+        shutil.copyfile(source, destination)
+        try:
+            os.chmod(destination, 0o600)
+        except OSError:
+            pass
+        record = CONTROL_PLANE.record_run_input(
+            run, kind=item.kind, name=item.name, content_type=item.content_type,
+            size_bytes=item.size_bytes, sha256=item.sha256,
+            workspace_path=str(destination.relative_to(paths.workspace)),
+            source_type=item.source_type, source_ref=item.source_ref,
+        )
+        records.append(run_input_payload(record))
+        # The bridge initially copies into the prepared inbox. Replace that
+        # mutable ingress filename with the digest-named manifest file.
+        if source != destination and source.parent == inbox:
+            source.unlink(missing_ok=True)
+    return records
+
+
+def replace_ingress_paths(message: str, inputs: list[PendingRunInput], manifest: list[dict[str, Any]]) -> str:
+    """Switch bridge ingress paths to immutable manifest paths before execution."""
+    value = message
+    paths_by_digest = {
+        item.get("sha256"): item.get("workspace_path")
+        for item in manifest
+        if isinstance(item.get("sha256"), str) and isinstance(item.get("workspace_path"), str)
+    }
+    for item in inputs:
+        workspace_path = paths_by_digest.get(item.sha256)
+        if item.requested_workspace_path and workspace_path:
+            value = value.replace(item.requested_workspace_path, workspace_path)
+    return value
 
 
 def run_artifacts(run: RunRecord) -> list[dict[str, Any]]:
@@ -634,6 +748,88 @@ def materialize_run_artifacts(run: RunRecord, session: SessionRecord, events: li
     return delivered
 
 
+def action_key_for_tool_call(run: RunRecord, tool_data: Any) -> tuple[str, str, str, str] | None:
+    """Derive one safe idempotency record from a structured DSH tool call."""
+    if not isinstance(tool_data, dict):
+        return None
+    name = tool_data.get("toolName") or tool_data.get("name")
+    call_id = tool_data.get("toolCallId") or tool_data.get("id")
+    arguments = tool_data.get("arguments")
+    if not isinstance(name, str) or not name or not isinstance(call_id, str) or not call_id:
+        return None
+    request_digest = hashlib.sha256(
+        json.dumps(arguments if isinstance(arguments, (dict, list)) else {}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    risk = "billable" if name in {"seedream_image", "seedance_video", "seed_audio", "volc_music", "omnihuman_avatar"} else "read"
+    return call_id[:256], name[:128], risk, request_digest
+
+
+def observe_run_notification(run: RunRecord, notification: Notification) -> None:
+    """Persist safe action/usage observations without treating model text as authority."""
+    if notification.method != "session.event":
+        return
+    raw_event = notification.payload.get("event")
+    if not isinstance(raw_event, dict):
+        return
+    event_type = raw_event.get("type")
+    data = raw_event.get("data")
+    if event_type == "tool/call":
+        derived = action_key_for_tool_call(run, data)
+        if derived is not None:
+            key, action_type, risk, digest = derived
+            action, _created = CONTROL_PLANE.create_or_get_action(
+                run, action_key=key, action_type=action_type, risk_class=risk, request_digest=digest,
+            )
+            if action.status == "PENDING":
+                CONTROL_PLANE.update_action(action.id, status="SUBMITTED")
+    elif event_type == "tool/result" and isinstance(data, dict):
+        call_id = data.get("toolCallId") or data.get("id")
+        if isinstance(call_id, str) and call_id:
+            with CONTROL_PLANE.transaction() as connection:
+                row = connection.execute(
+                    "SELECT * FROM run_actions WHERE run_id = ? AND action_key = ?", (run.id, call_id[:256]),
+                ).fetchone()
+            if row is not None:
+                action = CONTROL_PLANE._action_from_row(row)
+                provider_ref = provider_reference_from_tool_result(data)
+                is_error = bool(data.get("isError"))
+                CONTROL_PLANE.update_action(
+                    action.id, status="FAILED" if is_error else "SUCCEEDED", provider_ref=provider_ref,
+                )
+    elif event_type == "assistant/chunk" and isinstance(data, dict):
+        chunk = data.get("chunk")
+        usage = chunk.get("usage") if isinstance(chunk, dict) and chunk.get("type") == "usage" else None
+        if isinstance(usage, dict):
+            CONTROL_PLANE.record_usage(run, category="llm", quantity=usage, provider=PROVIDER, model_alias=run.model_alias)
+
+
+def provider_reference_from_tool_result(data: dict[str, Any]) -> str | None:
+    """Extract an external task ID only from a structured tool-result envelope."""
+    message = data.get("message")
+    blocks = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(blocks, list):
+        return None
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "tool-result":
+            continue
+        content = block.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "text" or not isinstance(item.get("text"), str):
+                continue
+            try:
+                parsed = json.loads(item["text"])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            candidate = parsed.get("task_id") or parsed.get("taskId")
+            if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", candidate):
+                return candidate
+    return None
+
+
 def execute_run_with_lease(
     run: RunRecord, session: SessionRecord, *, on_notification=None,
 ) -> tuple[RunRecord, Any]:
@@ -652,7 +848,11 @@ def execute_run_with_lease(
     try:
         try:
             result = run_turn(
-                session.id, running.message, on_notification=on_notification,
+                session.id, running.message,
+                on_notification=lambda notification: (
+                    observe_run_notification(running, notification),
+                    on_notification(notification) if on_notification is not None else None,
+                )[-1],
                 model_alias=running.model_alias, session=session, source=running.source,
             )
         except BaseException as exc:
@@ -674,6 +874,11 @@ def execute_run_with_lease(
                     "finish_reason": result.finish_reason,
                     "artifacts": artifacts,
                 },
+            )
+            CONTROL_PLANE.append_audit(
+                running.tenant_id, "run.succeeded",
+                {"artifact_count": len(artifacts), "input_manifest_status": running.input_manifest_status},
+                principal_id=running.principal_id, run_id=running.id,
             )
         return final, result
     finally:
@@ -745,6 +950,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        if path == "/internal/deliveries/claim":
+            self.claim_internal_deliveries()
+            return
         if path.startswith("/internal/artifacts/") and path.endswith("/download"):
             self.download_internal_artifact(path)
             return
@@ -756,6 +964,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/v1/artifacts/"):
             self.get_control_artifact(path)
+            return
+        if path == "/v1/operations/summary":
+            self.get_operations_summary()
             return
         if path.startswith("/v1/runs/") and path.endswith("/events"):
             self.stream_run_events(path)
@@ -790,6 +1001,21 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/internal/sessions/resolve":
             self.resolve_internal_session()
+            return
+        if path.startswith("/internal/sessions/") and path.endswith("/runs/prepare"):
+            self.prepare_internal_run(path)
+            return
+        if path.startswith("/internal/runs/") and path.endswith("/inputs/finalize"):
+            self.finalize_internal_run_inputs(path)
+            return
+        if path.startswith("/internal/runs/") and path.endswith("/stream"):
+            self.stream_internal_run(path)
+            return
+        if path.startswith("/internal/runs/") and path.endswith("/deliveries"):
+            self.create_internal_delivery(path)
+            return
+        if path.startswith("/internal/deliveries/") and path.endswith("/finish"):
+            self.finish_internal_delivery(path)
             return
         if path == "/v1/agents":
             self.publish_control_agent_version()
@@ -893,11 +1119,206 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_session_id", "session_id must be valid")
             if model is not None and not isinstance(model, str):
                 raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_model", "model must be a configured alias")
-            session = CONTROL_PLANE.get_or_create_compat_session(
-                LOCAL_IDENTITY, session_id, model_alias=resolve_model_alias(model) if model is not None else None,
-            )
+            external_conversation = request.get("external_conversation_id")
+            conversation_kind = request.get("conversation_kind")
+            principal_ref = request.get("principal_ref")
+            if external_conversation is not None or conversation_kind is not None or principal_ref is not None:
+                if not isinstance(external_conversation, str) or not isinstance(conversation_kind, str):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_external_conversation", "External conversation binding is invalid")
+                if not isinstance(principal_ref, str) or not principal_ref or len(principal_ref) > 512:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_external_principal", "External principal is invalid")
+                identity = Identity(
+                    CONTROL_PLANE_TENANT, f"feishu-{hashlib.sha256(principal_ref.encode('utf-8')).hexdigest()[:32]}", "chat",
+                )
+                binding = CONTROL_PLANE.bind_external_conversation(
+                    identity, source="feishu", external_conversation_id=external_conversation,
+                    conversation_kind=conversation_kind,
+                    model_alias=resolve_model_alias(model) if model is not None else None,
+                )
+                session = CONTROL_PLANE.get_session(Identity(identity.tenant_id, identity.principal_id, "chat"), binding.session_id)
+            else:
+                session = CONTROL_PLANE.get_or_create_compat_session(
+                    LOCAL_IDENTITY, session_id, model_alias=resolve_model_alias(model) if model is not None else None,
+                )
             CONTROL_PLANE.import_legacy_conversation(session, conversation_path(session.id))
             self.send_json(HTTPStatus.OK, internal_session_payload(session))
+        except ControlPlaneError as exc:
+            self.send_error_json(control_error_status(exc), exc.code, exc.message)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+
+    def prepare_internal_run(self, path: str) -> None:
+        """Create a Feishu Run before ingress files are copied into its inbox."""
+        try:
+            request = self.read_internal_request(require_body=True)
+            prefix = "/internal/sessions/"
+            session_id = path.removeprefix(prefix).removesuffix("/runs/prepare")
+            if not session_id or "/" in session_id:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
+            message = request.get("message")
+            source_ref = request.get("source_ref")
+            if not isinstance(message, str) or not message.strip():
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_message", "message must be a non-empty string")
+            if not isinstance(source_ref, str) or not source_ref or len(source_ref) > 512:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_source_ref", "source_ref must be valid")
+            session = CONTROL_PLANE.get_session_for_internal_bridge(session_id)
+            run, created = CONTROL_PLANE.create_run(
+                identity_for_session(session), session, message=message,
+                idempotency_key=f"feishu:{hashlib.sha256(source_ref.encode('utf-8')).hexdigest()}",
+                source="feishu", initial_status="PREPARING", source_ref=source_ref,
+            )
+            paths = CONTROL_PLANE.ensure_session_storage(session)
+            inbox = (paths.workspace / "inbox" / run.id).resolve()
+            inbox.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(inbox, 0o700)
+            except OSError:
+                pass
+            CONTROL_PLANE.append_audit(
+                session.tenant_id, "run.prepared", {"source": "feishu", "created": created},
+                principal_id=session.principal_id, run_id=run.id,
+            )
+            self.send_json(HTTPStatus.CREATED if created else HTTPStatus.OK, {
+                **run_payload(run), "workspace": str(paths.workspace), "inbox": str(inbox),
+            })
+        except ControlPlaneError as exc:
+            self.send_error_json(control_error_status(exc), exc.code, exc.message)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+
+    def parse_internal_inputs(self, request: dict[str, Any]) -> list[PendingRunInput]:
+        raw_inputs = request.get("inputs", [])
+        if not isinstance(raw_inputs, list) or len(raw_inputs) > RUN_INPUT_MAX_ITEMS:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_inputs", "inputs must be a bounded array")
+        total = 0
+        parsed: list[PendingRunInput] = []
+        for item in raw_inputs:
+            if not isinstance(item, dict):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_inputs", "Each input must be an object")
+            kind, name = item.get("kind"), item.get("name")
+            content_type, size_bytes = item.get("content_type"), item.get("size_bytes")
+            sha256, staged_path, source_ref = item.get("sha256"), item.get("staged_path"), item.get("source_ref")
+            workspace_path = item.get("workspace_path")
+            if (
+                kind not in {"image", "audio", "video", "file"} or not isinstance(name, str)
+                or Path(name).name != name or (content_type is not None and not isinstance(content_type, str))
+                or not isinstance(size_bytes, int) or size_bytes < 1
+                or not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+                or not isinstance(staged_path, str) or not isinstance(workspace_path, str)
+                or PurePosixPath(workspace_path).is_absolute() or ".." in PurePosixPath(workspace_path).parts
+                or (source_ref is not None and not isinstance(source_ref, str))
+            ):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_inputs", "Input metadata is invalid")
+            total += size_bytes
+            if total > RUN_INPUT_MAX_BYTES:
+                raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "inputs_too_large", "Input total is too large")
+            parsed.append(PendingRunInput(
+                kind=kind, name=name, content_type=content_type, size_bytes=size_bytes,
+                sha256=sha256, staged_path=Path(staged_path), source_type="feishu", source_ref=source_ref,
+                requested_workspace_path=workspace_path,
+            ))
+        return parsed
+
+    def finalize_internal_run_inputs(self, path: str) -> None:
+        try:
+            request = self.read_internal_request(require_body=True)
+            run_id = path.removeprefix("/internal/runs/").removesuffix("/inputs/finalize")
+            if not run_id or "/" in run_id:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
+            run = CONTROL_PLANE.get_run_for_internal_bridge(run_id)
+            if run.source != "feishu" or run.status not in {"PREPARING", "QUEUED"}:
+                raise ApiError(HTTPStatus.CONFLICT, "run_not_preparing", "Run is not accepting inputs")
+            if run.status == "QUEUED" and run.input_manifest_status == "FINALIZED":
+                self.send_json(HTTPStatus.OK, {
+                    **run_payload(run),
+                    "inputs": [run_input_payload(item) for item in CONTROL_PLANE.run_inputs_for_internal_bridge(run.id)],
+                })
+                return
+            session = CONTROL_PLANE.session_for_run(run)
+            inputs = self.parse_internal_inputs(request)
+            expected_inbox = (CONTROL_PLANE.ensure_session_storage(session).workspace / "inbox" / run.id).resolve()
+            for item in inputs:
+                try:
+                    item.staged_path.resolve().relative_to(expected_inbox)
+                except ValueError as exc:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_inputs", "Input path is outside this Run inbox") from exc
+            final_message = request.get("message")
+            if final_message is not None:
+                if not isinstance(final_message, str) or not final_message.strip():
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_message", "Final run message must be non-empty")
+                run = CONTROL_PLANE.update_prepared_run_message(run.id, final_message)
+            manifest = materialize_run_inputs(run, session, inputs)
+            if final_message is not None:
+                run = CONTROL_PLANE.update_prepared_run_message(run.id, replace_ingress_paths(final_message, inputs, manifest))
+            CONTROL_PLANE.finalize_input_manifest(run.id)
+            finalized = CONTROL_PLANE.get_run_for_internal_bridge(run.id)
+            ensure_scheduler()
+            _scheduler_wakeup.set()
+            self.send_json(HTTPStatus.OK, {**run_payload(finalized), "inputs": manifest})
+        except ControlPlaneError as exc:
+            self.send_error_json(control_error_status(exc), exc.code, exc.message)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+
+    def get_operations_summary(self) -> None:
+        try:
+            request = self.read_control_request(require_body=False)
+            self.send_json(HTTPStatus.OK, CONTROL_PLANE.operations_summary(request.identity))
+        except ControlPlaneError as exc:
+            self.send_error_json(control_error_status(exc), exc.code, exc.message)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+
+    def create_internal_delivery(self, path: str) -> None:
+        try:
+            request = self.read_internal_request(require_body=True)
+            run_id = path.removeprefix("/internal/runs/").removesuffix("/deliveries")
+            if not run_id or "/" in run_id:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
+            run = CONTROL_PLANE.get_run_for_internal_bridge(run_id)
+            destination_ref = request.get("destination_ref")
+            idempotency_key = request.get("idempotency_key")
+            artifact_id = request.get("artifact_id")
+            payload = request.get("payload", {})
+            if not isinstance(destination_ref, str) or not isinstance(idempotency_key, str) or not isinstance(payload, dict):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_delivery", "Delivery payload is invalid")
+            if artifact_id is not None and not isinstance(artifact_id, str):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_delivery", "Artifact ID is invalid")
+            delivery, created = CONTROL_PLANE.create_delivery(
+                run, destination_type="feishu_message", destination_ref=destination_ref,
+                idempotency_key=idempotency_key, artifact_id=artifact_id, payload=payload,
+            )
+            self.send_json(HTTPStatus.CREATED if created else HTTPStatus.OK, delivery_payload(delivery))
+        except ControlPlaneError as exc:
+            self.send_error_json(control_error_status(exc), exc.code, exc.message)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+
+    def finish_internal_delivery(self, path: str) -> None:
+        try:
+            request = self.read_internal_request(require_body=True)
+            delivery_id = path.removeprefix("/internal/deliveries/").removesuffix("/finish")
+            if not delivery_id or "/" in delivery_id:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
+            delivered = request.get("delivered")
+            provider_ref = request.get("provider_delivery_ref")
+            error = request.get("error")
+            if not isinstance(delivered, bool) or (provider_ref is not None and not isinstance(provider_ref, str)) or (error is not None and not isinstance(error, str)):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_delivery", "Delivery completion payload is invalid")
+            record = CONTROL_PLANE.finish_delivery(
+                delivery_id, delivered=delivered, provider_delivery_ref=provider_ref, error=error,
+            )
+            self.send_json(HTTPStatus.OK, delivery_payload(record))
+        except ControlPlaneError as exc:
+            self.send_error_json(control_error_status(exc), exc.code, exc.message)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+
+    def claim_internal_deliveries(self) -> None:
+        try:
+            self.read_internal_request()
+            rows = CONTROL_PLANE.claim_due_deliveries(destination_type="feishu_message")
+            self.send_json(HTTPStatus.OK, {"deliveries": [delivery_payload(row) for row in rows]})
         except ControlPlaneError as exc:
             self.send_error_json(control_error_status(exc), exc.code, exc.message)
         except ApiError as exc:
@@ -909,7 +1330,7 @@ class Handler(BaseHTTPRequestHandler):
             session_id = path.removeprefix("/internal/sessions/").removesuffix("/workspace")
             if not session_id or "/" in session_id:
                 raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
-            session = CONTROL_PLANE.get_session(LOCAL_IDENTITY, session_id)
+            session = CONTROL_PLANE.get_session_for_internal_bridge(session_id)
             self.send_json(HTTPStatus.OK, session_payload(session))
         except ControlPlaneError as exc:
             self.send_error_json(control_error_status(exc), exc.code, exc.message)
@@ -945,7 +1366,7 @@ class Handler(BaseHTTPRequestHandler):
         if row is None:
             raise ControlPlaneError("artifact_not_found", "Artifact was not found")
         artifact = {key: row[key] for key in row.keys()}
-        session = CONTROL_PLANE.get_session(LOCAL_IDENTITY, str(artifact["session_id"]))
+        session = CONTROL_PLANE.get_session_for_internal_bridge(str(artifact["session_id"]))
         return artifact, session, artifact_file(artifact, session)
 
     def download_internal_artifact(self, path: str) -> None:
@@ -1251,6 +1672,77 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             # The current SDK has no per-turn cancellation. The Agent continues
             # to a durable idle boundary after a client disconnects.
+            pass
+        finally:
+            self.close_connection = True
+
+    def stream_internal_run(self, path: str) -> None:
+        """Stream a prepared Feishu Run without creating a second run record."""
+        try:
+            self.read_internal_request()
+            run_id = path.removeprefix("/internal/runs/").removesuffix("/stream")
+            if not run_id or "/" in run_id:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
+            run = CONTROL_PLANE.get_run_for_internal_bridge(run_id)
+            if run.source != "feishu" or run.status != "QUEUED" or run.input_manifest_status != "FINALIZED":
+                raise ApiError(HTTPStatus.CONFLICT, "run_not_ready", "Run is not ready for execution")
+            session = CONTROL_PLANE.session_for_run(run)
+            if not _slots.acquire(blocking=False):
+                raise ApiError(HTTPStatus.TOO_MANY_REQUESTS, "busy", "Too many sessions are running")
+            try:
+                claimed = CONTROL_PLANE.claim_run(run.id, EXECUTOR_ID, lease_seconds=RUN_LEASE_SECONDS)
+            except BaseException:
+                _slots.release()
+                raise
+            started_at = time.monotonic()
+            stream: queue.Queue[tuple[str, dict[str, Any]] | BaseException | None] = queue.Queue()
+
+            def on_notification(notification: Notification) -> None:
+                for event_name, data in sse_events_for_notification(notification):
+                    CONTROL_PLANE.append_event(claimed.id, event_name, data)
+                    stream.put((event_name, data))
+
+            def worker() -> None:
+                try:
+                    final_run, result = execute_run_with_lease(claimed, session, on_notification=on_notification)
+                    stream.put(("done", {
+                        "session_id": session.id, "model": session.model_alias, "run_id": claimed.id,
+                        "answer": result.final_response, "finish_reason": result.finish_reason,
+                        "artifacts": run_artifacts(final_run),
+                        "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                        **({"error": final_run.error} if final_run.error is not None else {}),
+                    }))
+                except BaseException as exc:
+                    fail_run_best_effort(claimed, exc)
+                    stream.put(exc)
+                finally:
+                    stream.put(None)
+                    _slots.release()
+
+            self.start_sse_response()
+            self.write_sse("session", {"session_id": session.id, "model": session.model_alias, "run_id": claimed.id})
+            _executor.submit(worker)
+            while True:
+                try:
+                    item = stream.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                if item is None:
+                    break
+                if isinstance(item, BaseException):
+                    request_id = uuid.uuid4().hex
+                    print(f"[{request_id}] internal run stream failed: {type(item).__name__}: {item}", flush=True)
+                    self.write_sse("error", {"code": "agent_error", "message": f"Agent execution failed; request_id={request_id}"})
+                    continue
+                event_name, data = item
+                self.write_sse(event_name, data)
+        except ControlPlaneError as exc:
+            self.send_error_json(control_error_status(exc), exc.code, exc.message)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+        except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
             self.close_connection = True

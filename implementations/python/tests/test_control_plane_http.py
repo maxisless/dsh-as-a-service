@@ -175,6 +175,57 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
         self.assertEqual(duplicate_status, 200)
         self.assertEqual(json.loads(first_raw)["run_id"], json.loads(second_raw)["run_id"])
 
+    def test_operations_summary_requires_manager_role_and_returns_tenant_counters(self) -> None:
+        auth = {"Authorization": "Bearer test-token"}
+        status, _, raw = self.request("GET", "/v1/operations/summary", headers=auth)
+        self.assertEqual(status, 200)
+        summary = json.loads(raw)
+        self.assertIn("runs", summary)
+        self.assertIn("deliveries", summary)
+        self.assertIn("estimated_cost_micros", summary)
+
+    def test_internal_delivery_outbox_is_idempotent_and_claimable(self) -> None:
+        headers = {"X-DSH-Internal-Token": "internal-test-token"}
+        binding = {
+            "session_id": "caller-control", "external_conversation_id": "oc_delivery", "conversation_kind": "group",
+            "principal_ref": "group:oc_delivery",
+        }
+        status, _, raw = self.request("POST", "/internal/sessions/resolve", binding, headers)
+        self.assertEqual(status, 200)
+        session = json.loads(raw)
+        status, _, raw = self.request(
+            "POST", f"/internal/sessions/{session['session_id']}/runs/prepare",
+            {"message": "hello", "source_ref": "om_delivery"}, headers,
+        )
+        self.assertEqual(status, 201)
+        prepared = json.loads(raw)
+        status, _, _ = self.request(
+            "POST", f"/internal/runs/{prepared['run_id']}/inputs/finalize",
+            {"message": "hello", "inputs": []}, headers,
+        )
+        self.assertEqual(status, 200)
+        payload = {
+            "destination_ref": "om_delivery", "idempotency_key": "text-delivery",
+            "payload": {"kind": "text", "text": "hello"},
+        }
+        status, _, raw = self.request("POST", f"/internal/runs/{prepared['run_id']}/deliveries", payload, headers)
+        self.assertEqual(status, 201)
+        delivery = json.loads(raw)
+        duplicate_status, _, duplicate_raw = self.request(
+            "POST", f"/internal/runs/{prepared['run_id']}/deliveries", payload, headers,
+        )
+        self.assertEqual(duplicate_status, 200)
+        self.assertEqual(json.loads(duplicate_raw)["delivery_id"], delivery["delivery_id"])
+        status, _, raw = self.request("GET", "/internal/deliveries/claim", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["deliveries"][0]["delivery_id"], delivery["delivery_id"])
+        status, _, raw = self.request(
+            "POST", f"/internal/deliveries/{delivery['delivery_id']}/finish",
+            {"delivered": True, "provider_delivery_ref": "om_delivery_reply"}, headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["status"], "DELIVERED")
+
     def test_compat_chat_uses_control_plane_session_workspace(self) -> None:
         status, _, raw = self.request("POST", "/chat", {"session_id": "legacy-demo", "message": "hello"})
         self.assertEqual(status, 200)
@@ -199,6 +250,64 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
         )
         self.assertEqual(status, 401)
         self.assertEqual(json.loads(raw)["error"]["code"], "unauthorized")
+
+    def test_internal_feishu_binding_uses_server_issued_session_and_principal_scope(self) -> None:
+        headers = {"X-DSH-Internal-Token": "internal-test-token"}
+        body = {
+            "session_id": "caller-controlled-value",
+            "external_conversation_id": "oc_group_1",
+            "conversation_kind": "group",
+            "principal_ref": "group:oc_group_1",
+        }
+        status, _, raw = self.request("POST", "/internal/sessions/resolve", body, headers)
+        self.assertEqual(status, 200)
+        first = json.loads(raw)
+        self.assertTrue(first["session_id"].startswith("s_"))
+        self.assertNotEqual(first["session_id"], "caller-controlled-value")
+        status, _, raw = self.request("POST", "/internal/sessions/resolve", body, headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["session_id"], first["session_id"])
+
+    def test_internal_prepare_finalize_and_stream_uses_one_manifest_bound_run(self) -> None:
+        headers = {"X-DSH-Internal-Token": "internal-test-token"}
+        binding = {
+            "session_id": "caller-controlled-value",
+            "external_conversation_id": "oc_group_2",
+            "conversation_kind": "group",
+            "principal_ref": "group:oc_group_2",
+        }
+        status, _, raw = self.request("POST", "/internal/sessions/resolve", binding, headers)
+        self.assertEqual(status, 200)
+        session = json.loads(raw)
+        status, _, raw = self.request(
+            "POST", f"/internal/sessions/{session['session_id']}/runs/prepare",
+            {"message": "artifact", "source_ref": "om_prepare_1"}, headers,
+        )
+        self.assertEqual(status, 201)
+        prepared = json.loads(raw)
+        self.assertEqual(prepared["status"], "PREPARING")
+        inbox = Path(prepared["inbox"])
+        sample = inbox / "input.txt"
+        sample.write_text("input", encoding="utf-8")
+        digest = __import__("hashlib").sha256(b"input").hexdigest()
+        with patch.object(server, "ARTIFACT_RESULT_TYPES", frozenset({"private.result"})):
+            status, _, raw = self.request(
+                "POST", f"/internal/runs/{prepared['run_id']}/inputs/finalize",
+                {"message": "artifact", "inputs": [{
+                    "kind": "file", "name": "input.txt", "content_type": "text/plain", "size_bytes": 5,
+                    "sha256": digest, "staged_path": str(sample), "workspace_path": "inbox/r/input.txt", "source_ref": "file_v3_input",
+                }]}, headers,
+            )
+            self.assertEqual(status, 200, raw.decode("utf-8"))
+            finalized = json.loads(raw)
+            self.assertEqual(finalized["status"], "QUEUED")
+            self.assertEqual(finalized["input_manifest_status"], "FINALIZED")
+            status, response_headers, stream = self.request(
+                "POST", f"/internal/runs/{prepared['run_id']}/stream", {}, headers,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(response_headers["Content-Type"], "text/event-stream; charset=utf-8")
+        self.assertIn("event: done", stream.decode("utf-8"))
 
     def test_compat_chat_returns_registered_artifacts_without_server_path(self) -> None:
         with patch.object(server, "ARTIFACT_RESULT_TYPES", frozenset({"private.result"})):

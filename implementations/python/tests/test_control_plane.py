@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import hashlib
 from pathlib import Path
 
 from control_plane import ControlPlane, ControlPlaneError, Identity
@@ -116,6 +117,71 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(ControlPlaneError) as raised:
             self.plane.get_artifact(other_principal, artifact["artifact_id"])
         self.assertEqual(raised.exception.code, "artifact_not_found")
+
+    def test_external_binding_is_stable_and_rejects_another_principal(self) -> None:
+        first = self.plane.bind_external_conversation(
+            self.user, source="feishu", external_conversation_id="oc_group_123", conversation_kind="group",
+        )
+        second = self.plane.bind_external_conversation(
+            self.user, source="feishu", external_conversation_id="oc_group_123", conversation_kind="group",
+        )
+        self.assertEqual(first.session_id, second.session_id)
+        self.assertEqual(first.external_conversation_hash, hashlib.sha256(b"oc_group_123").hexdigest())
+        other = Identity("acme", "charlie", "chat")
+        with self.assertRaises(ControlPlaneError) as raised:
+            self.plane.bind_external_conversation(
+                other, source="feishu", external_conversation_id="oc_group_123", conversation_kind="group",
+            )
+        self.assertEqual(raised.exception.code, "external_conversation_conflict")
+
+    def test_prepared_run_input_manifest_action_delivery_and_operations_summary(self) -> None:
+        session = self.plane.create_session(self.user, agent_id="sales")
+        run, created = self.plane.create_run(
+            self.user, session, message="with attachment", idempotency_key="prepare-1", source="feishu", initial_status="PREPARING",
+        )
+        self.assertTrue(created)
+        self.assertEqual(run.status, "PREPARING")
+        input_record = self.plane.record_run_input(
+            run, kind="image", name="reference.png", content_type="image/png", size_bytes=7,
+            sha256=hashlib.sha256(b"content").hexdigest(), workspace_path="inbox/r/reference.png",
+            source_type="feishu", source_ref="om_message_1",
+        )
+        self.assertEqual(input_record.source_ref_hash, hashlib.sha256(b"om_message_1").hexdigest())
+        finalized = self.plane.finalize_input_manifest(run.id)
+        self.assertEqual(finalized.status, "QUEUED")
+        self.assertEqual(finalized.input_manifest_status, "FINALIZED")
+        action, created = self.plane.create_or_get_action(
+            finalized, action_key="tool-call-1", action_type="seedance_video", risk_class="billable",
+            request_digest=hashlib.sha256(b"request").hexdigest(),
+        )
+        self.assertTrue(created)
+        submitted = self.plane.update_action(action.id, status="SUBMITTED", provider_ref="task-1")
+        self.assertEqual(submitted.provider_ref, "task-1")
+        delivery, created = self.plane.create_delivery(
+            finalized, destination_type="feishu_message", destination_ref="om_message_1",
+            idempotency_key="delivery-1", action_id=action.id,
+        )
+        self.assertTrue(created)
+        claimed = self.plane.claim_due_deliveries(destination_type="feishu_message")
+        self.assertEqual([item.id for item in claimed], [delivery.id])
+        done = self.plane.finish_delivery(delivery.id, delivered=True, provider_delivery_ref="om_reply_1")
+        self.assertEqual(done.status, "DELIVERED")
+        self.plane.record_usage(finalized, category="media", quantity={"seconds": 5}, estimated_cost_micros=100)
+        summary = self.plane.operations_summary(self.admin)
+        self.assertEqual(summary["runs"]["QUEUED"], 1)
+        self.assertEqual(summary["deliveries"]["DELIVERED"], 1)
+        self.assertEqual(summary["estimated_cost_micros"], 100)
+
+    def test_stale_preparing_run_expires_when_scheduler_claims_work(self) -> None:
+        session = self.plane.create_session(self.user, agent_id="sales")
+        run, _ = self.plane.create_run(
+            self.user, session, message="pending input", source="feishu", initial_status="PREPARING",
+        )
+        with self.plane.transaction(immediate=True) as connection:
+            connection.execute("UPDATE runs SET created_at = ? WHERE id = ?", (0, run.id))
+        self.assertIsNone(self.plane.claim_next_run("executor", lease_seconds=30))
+        expired = self.plane.get_run(self.user, run.id)
+        self.assertEqual(expired.status, "EXPIRED")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,11 @@ const worker = createServer(async (request, response) => {
     response.end(JSON.stringify({ authorization: request.headers.authorization }));
     return;
   }
+  if (request.method === "GET" && request.url === "/v1/operations/summary") {
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ authorization: request.headers.authorization, operations: true }));
+    return;
+  }
   if (request.method === "POST" && request.url === "/chat/stream") {
     response.writeHead(200, { "content-type": "text/event-stream" });
     response.write("event: session\ndata: {\\\"session_id\\\":\\\"demo\\\"}\n\n");
@@ -129,5 +134,15 @@ test("forwards artifact download identity header", async () => {
   });
   const value = await response.json();
   assert.equal(response.status, 200);
+  assert.equal(value.authorization, "Bearer test-token");
+});
+
+test("forwards operations summary identity header", async () => {
+  const response = await fetch("http://127.0.0.1:19002/v1/operations/summary", {
+    headers: { authorization: "Bearer test-token" }
+  });
+  const value = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(value.operations, true);
   assert.equal(value.authorization, "Bearer test-token");
 });

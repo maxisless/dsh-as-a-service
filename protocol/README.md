@@ -46,6 +46,9 @@ substitute for production OAuth/API-key management or a Vault.
 - `GET /v1/artifacts/{artifact_id}` downloads a completed artifact after the
   same tenant/principal authorization check. Run responses expose artifact IDs
   and metadata, never server filesystem paths.
+- `GET /v1/operations/summary` is admin/manager-only and returns tenant-scoped
+  Run, delivery, and recorded-cost counters; it never returns user messages,
+  media bytes, or credentials.
 
 The Worker now gives every control-plane session a distinct workspace, DSH
 session state root, conversation file, and Harness instance. This is the safe

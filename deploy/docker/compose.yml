@@ -8,7 +8,7 @@ services:
     image: dsh-as-a-service-python:local
     init: true
     env_file:
-      - .env
+      - ${DSH_WORKER_ENV_FILE:-.env}
     environment:
       DSH_HTTP_HOST: 0.0.0.0
       DSH_HTTP_PORT: "8765"
@@ -23,8 +23,8 @@ services:
       - "127.0.0.1:8765:8765"
     volumes:
       - dsh-python-data:/data
-      - ./models.json:/config/models.json:ro
-      - ./dsh-home:/home/dsh/.dsh:ro
+      - ${DSH_MODELS_FILE:-./models.json}:/config/models.json:ro
+      - ${DSH_HOME_DIR:-./dsh-home}:/home/dsh/.dsh:ro
     restart: unless-stopped
 
 volumes:

@@ -22,6 +22,19 @@ For a provider configured through DSH pi-ai, put settings.yaml and, when needed,
 container user's DSH_HOME. Both the directory and its files should be readable
 only by the container user (uid 10001) on the host.
 
+For a host where deployment-only assets must stay outside this Git checkout,
+point Compose at their secure locations instead:
+
+```bash
+DSH_WORKER_ENV_FILE=/secure/dsh/worker.env \
+DSH_MODELS_FILE=/secure/dsh/models.json \
+DSH_HOME_DIR=/secure/dsh/dsh-home \
+docker compose -f compose.yml up --build -d
+```
+
+The same variables are used by `deploy/bootstrap-machine.sh` when preparing a
+fresh machine.
+
 ## Restricted Docker networks
 
 The default base image is python:3.11-slim-bookworm. If a Docker host cannot

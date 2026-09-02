@@ -134,6 +134,19 @@ class ControlPlaneTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "external_conversation_conflict")
 
+    def test_external_binding_rejects_a_later_agent_change(self) -> None:
+        first = self.plane.bind_external_conversation(
+            self.user, source="feishu", external_conversation_id="oc_agent_123", conversation_kind="group",
+            agent_id="sales", agent_version="v1",
+        )
+        self.assertTrue(first.session_id.startswith("s_"))
+        with self.assertRaises(ControlPlaneError) as raised:
+            self.plane.bind_external_conversation(
+                self.user, source="feishu", external_conversation_id="oc_agent_123", conversation_kind="group",
+                agent_id="default",
+            )
+        self.assertEqual(raised.exception.code, "external_conversation_conflict")
+
     def test_prepared_run_input_manifest_action_delivery_and_operations_summary(self) -> None:
         session = self.plane.create_session(self.user, agent_id="sales")
         run, created = self.plane.create_run(

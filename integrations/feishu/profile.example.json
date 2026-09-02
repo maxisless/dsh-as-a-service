@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "kind": "feishu-channel-instance",
+  "instance_id": "example-assistant",
+  "display": {
+    "name": "Example Assistant",
+    "subtitle": "正在为你处理"
+  },
+  "worker": {
+    "chat_url": "http://127.0.0.1:8765/chat",
+    "container": "worker-container-name"
+  },
+  "agent": {
+    "id": "default",
+    "version": null
+  },
+  "behavior": {
+    "group_require_mention": true,
+    "contact_enrichment": true,
+    "max_workers": 4,
+    "request_timeout_seconds": 2400,
+    "max_message_chars": 20000,
+    "max_reply_chars": 20000,
+    "card_update_interval_seconds": 1.0,
+    "delivery_replay_interval_seconds": 60,
+    "max_inbound_media_items": 12
+  },
+  "credentials": {
+    "app_id_env": "FEISHU_APP_ID",
+    "app_secret_env": "FEISHU_APP_SECRET",
+    "bot_open_id_env": "FEISHU_BOT_OPEN_ID",
+    "internal_bridge_token_env": "DSH_INTERNAL_BRIDGE_TOKEN"
+  }
+}

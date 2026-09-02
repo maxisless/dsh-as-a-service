@@ -24,7 +24,13 @@ This repository is public source only. Never commit or copy into it:
 
 - API keys, app secrets, tokens, credentials, user data, conversation memory, generated media, or runtime logs;
 - model endpoint IDs, server addresses, server-local paths, or deployment-only configuration;
-- private Skills, Feishu bridge code/configuration, or private Docker Compose overrides.
+- instance-specific Feishu configuration, private Skills, or private Docker Compose overrides.
+
+The repository may contain a generic, configuration-driven channel integration
+under `integrations/`. Such code must not contain a bot name, tenant or user
+information, credentials, server-local paths, installed Skills, endpoint IDs,
+or runtime state. Every concrete channel profile and secrets file remains
+outside this Git worktree.
 
 On the server, private configuration and extension state remain outside this Git worktree. The public Compose file is combined at runtime with an untracked private override; the deployment timer updates only the tracked GitHub checkout and preserves that private layer.
 Private source code that needs deployment (such as a bot bridge or account-specific extension) belongs in a separate **private** GitHub repository and follows the same local-test → push → server-pull process. Only its secrets, runtime state, and deployment-only configuration remain server-local.

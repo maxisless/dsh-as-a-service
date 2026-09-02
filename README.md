@@ -148,8 +148,11 @@ scope, but it is not a tenant isolation boundary. Before public exposure, add
 authentication, authorization, quotas, audit logs, tenant-aware storage, and
 stronger sandboxing.
 
-This repository contains no application Skills, media adapters, bot bridges,
-runtime state, credentials, or account-specific model endpoint IDs.
+This repository contains no application Skills, media adapters, instance
+profiles, runtime state, credentials, or account-specific model endpoint IDs.
+It does include an optional generic Feishu channel transport; its concrete bot
+profile and secrets always live outside the Git checkout. See
+[Feishu channel deployment](docs/feishu-channel-deployment.md).
 
 For the target hosted architecture—tenant policy boundaries, session-scoped
 files and memory, reusable DSH runtime pools, artifacts, and scheduling—see:

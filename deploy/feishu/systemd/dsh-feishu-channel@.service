@@ -1,0 +1,23 @@
+[Unit]
+Description=DSH Feishu channel bridge (%i)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=__INSTALL_ROOT__
+EnvironmentFile=__CONFIG_ROOT__/secrets.env
+Environment=FEISHU_CHANNEL_PROFILE=__CONFIG_ROOT__/profile.json
+Environment=FEISHU_CHANNEL_STATE_DB=__STATE_ROOT__/bridge.sqlite3
+Environment=FEISHU_CHANNEL_ARTIFACT_DIR=__STATE_ROOT__/artifacts
+ExecStart=__VENV__/bin/python -m integrations.feishu.bridge --profile __CONFIG_ROOT__/profile.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ReadWritePaths=__STATE_ROOT__
+
+[Install]
+WantedBy=multi-user.target

@@ -1122,6 +1122,12 @@ class Handler(BaseHTTPRequestHandler):
             external_conversation = request.get("external_conversation_id")
             conversation_kind = request.get("conversation_kind")
             principal_ref = request.get("principal_ref")
+            agent_id = request.get("agent_id", "default")
+            agent_version = request.get("agent_version")
+            if not isinstance(agent_id, str) or not agent_id or len(agent_id) > 255:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_agent", "agent_id must be a non-empty string")
+            if agent_version is not None and (not isinstance(agent_version, str) or not agent_version or len(agent_version) > 255):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_agent_version", "agent_version must be a non-empty string when supplied")
             if external_conversation is not None or conversation_kind is not None or principal_ref is not None:
                 if not isinstance(external_conversation, str) or not isinstance(conversation_kind, str):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_external_conversation", "External conversation binding is invalid")
@@ -1133,6 +1139,7 @@ class Handler(BaseHTTPRequestHandler):
                 binding = CONTROL_PLANE.bind_external_conversation(
                     identity, source="feishu", external_conversation_id=external_conversation,
                     conversation_kind=conversation_kind,
+                    agent_id=agent_id, agent_version=agent_version,
                     model_alias=resolve_model_alias(model) if model is not None else None,
                 )
                 session = CONTROL_PLANE.get_session(Identity(identity.tenant_id, identity.principal_id, "chat"), binding.session_id)

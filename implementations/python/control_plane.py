@@ -663,6 +663,8 @@ class ControlPlane:
         source: str,
         external_conversation_id: str,
         conversation_kind: str,
+        agent_id: str = "default",
+        agent_version: str | None = None,
         model_alias: str | None = None,
         existing_session: SessionRecord | None = None,
     ) -> ExternalConversationBinding:
@@ -694,6 +696,8 @@ class ControlPlane:
                     raise ControlPlaneError("session_inactive", "Bound session is not active")
                 if model_alias is not None and session_row["model_alias"] != model_alias:
                     raise ControlPlaneError("session_model_conflict", "Bound session uses a different model")
+                if session_row["agent_id"] != agent_id or (agent_version is not None and session_row["agent_version"] != agent_version):
+                    raise ControlPlaneError("external_conversation_conflict", "Bound session uses a different Agent version")
                 connection.execute(
                     "UPDATE external_conversation_bindings SET updated_at = ? WHERE source = ? AND external_conversation_hash = ?",
                     (now, source, digest),
@@ -714,9 +718,11 @@ class ControlPlane:
                 raise ControlPlaneError("session_inactive", "Existing session is not active")
             if model_alias is not None and existing_session.model_alias != model_alias:
                 raise ControlPlaneError("session_model_conflict", "Existing session uses a different model")
+            if existing_session.agent_id != agent_id or (agent_version is not None and existing_session.agent_version != agent_version):
+                raise ControlPlaneError("external_conversation_conflict", "Existing session uses a different Agent version")
             session = existing_session
         else:
-            session = self.create_session(identity, model_alias=model_alias)
+            session = self.create_session(identity, agent_id=agent_id, agent_version=agent_version, model_alias=model_alias)
         with self.transaction(immediate=True) as connection:
             existing = connection.execute(
                 "SELECT * FROM external_conversation_bindings WHERE source = ? AND external_conversation_hash = ?",

@@ -1,5 +1,6 @@
 .env
 .venv/
+.venv-feishu-channel/
 __pycache__/
 *.py[cod]
 *.so
@@ -27,3 +28,9 @@ deploy/docker/wheelhouse/*
 # Private server-local Compose overrides are combined with the public Compose
 # file at deployment time; they must never be committed.
 deploy/docker/compose.private*.yml
+
+# Optional channel-instance configuration and runtime state. Keep the portable
+# profile and the separately permissioned secrets file outside this worktree.
+deploy/instances/
+integrations/feishu/*.local.json
+integrations/feishu/*.secrets.env

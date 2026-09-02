@@ -268,6 +268,32 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(raw)["session_id"], first["session_id"])
 
+    def test_internal_feishu_binding_pins_configured_agent_version(self) -> None:
+        headers = {"X-DSH-Internal-Token": "internal-test-token"}
+        auth = {"Authorization": "Bearer test-token"}
+        status, _, _ = self.request(
+            "POST", "/v1/agents",
+            {
+                "agent_id": "channel-agent", "version": "v7",
+                "display_name": "Channel agent", "default_model": "deepseek",
+            },
+            auth,
+        )
+        self.assertEqual(status, 201)
+        binding = {
+            "session_id": "caller-controlled-value",
+            "external_conversation_id": "oc_agent_pinned",
+            "conversation_kind": "p2p",
+            "principal_ref": "user:ou_agent_pinned",
+            "agent_id": "channel-agent",
+            "agent_version": "v7",
+        }
+        status, _, raw = self.request("POST", "/internal/sessions/resolve", binding, headers)
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        self.assertEqual(payload["agent_id"], "channel-agent")
+        self.assertEqual(payload["agent_version"], "v7")
+
     def test_internal_prepare_finalize_and_stream_uses_one_manifest_bound_run(self) -> None:
         headers = {"X-DSH-Internal-Token": "internal-test-token"}
         binding = {

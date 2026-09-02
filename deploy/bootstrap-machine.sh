@@ -91,7 +91,19 @@ export DSH_MODELS_FILE="${MODELS_FILE}"
 export DSH_HOME_DIR="${DSH_HOME_DIR}"
 export COMPOSE_PROJECT_NAME
 docker compose -f "${INSTALL_ROOT}/deploy/docker/compose.yml" --project-directory "${INSTALL_ROOT}/deploy/docker" up --build -d
-curl --fail --silent --show-error http://127.0.0.1:8765/health >/dev/null
+worker_ready=false
+for _attempt in $(seq 1 30); do
+  if curl --fail --silent --show-error http://127.0.0.1:8765/health >/dev/null 2>&1; then
+    worker_ready=true
+    break
+  fi
+  sleep 2
+done
+if [[ ${worker_ready} != true ]]; then
+  echo "Worker did not become healthy within 60 seconds." >&2
+  docker compose -f "${INSTALL_ROOT}/deploy/docker/compose.yml" --project-directory "${INSTALL_ROOT}/deploy/docker" logs --tail 200 python-worker >&2 || true
+  exit 1
+fi
 
 if [[ -n ${CHANNEL_PROFILE} ]]; then
   channel_args=(

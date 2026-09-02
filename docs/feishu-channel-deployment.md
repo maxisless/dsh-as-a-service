@@ -73,8 +73,8 @@ sudo ./deploy/bootstrap-machine.sh \
 
 The bootstrap only accepts a fresh installation root. It clones the requested
 public revision, mounts private Worker configuration from its original secure
-location, checks the local health endpoint, then delegates the optional channel
-installation to `install-channel.sh`.
+location, waits up to one minute for the local health endpoint, then delegates
+the optional channel installation to `install-channel.sh`.
 
 Do not run the old and new bridge for the same Feishu app concurrently. The
 current single-node deduplication database is local to one bridge host. Stop

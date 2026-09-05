@@ -93,6 +93,26 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertTrue(canceled.cancel_requested)
         self.assertEqual(self.plane.events_after(self.user, run.id, 0)[-1]["event"], "done")
 
+    def test_internal_bridge_cancels_only_latest_active_run_in_session(self) -> None:
+        session = self.plane.create_session(self.user, agent_id="sales")
+        older, _ = self.plane.create_run(self.user, session, message="older", initial_status="PREPARING")
+        newer, _ = self.plane.create_run(self.user, session, message="newer", initial_status="PREPARING")
+
+        canceled = self.plane.cancel_latest_active_run_for_internal_bridge(session.id)
+
+        self.assertIsNotNone(canceled)
+        assert canceled is not None
+        self.assertEqual(canceled.id, newer.id)
+        self.assertEqual(canceled.status, "CANCELED")
+        self.assertTrue(canceled.cancel_requested)
+        self.assertEqual(self.plane.get_run(self.user, older.id).status, "PREPARING")
+        older_canceled = self.plane.cancel_latest_active_run_for_internal_bridge(session.id)
+        self.assertIsNotNone(older_canceled)
+        assert older_canceled is not None
+        self.assertEqual(older_canceled.id, older.id)
+        self.assertEqual(older_canceled.status, "CANCELED")
+        self.assertIsNone(self.plane.cancel_latest_active_run_for_internal_bridge(session.id))
+
     def test_artifact_is_tenant_scoped(self) -> None:
         session = self.plane.create_session(self.user, agent_id="sales")
         run, _ = self.plane.create_run(self.user, session, message="artifact")

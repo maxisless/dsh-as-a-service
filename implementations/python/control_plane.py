@@ -1390,23 +1390,48 @@ class ControlPlane:
 
     def request_cancel(self, identity: Identity, run_id: str) -> RunRecord:
         run = self.get_run(identity, run_id)
-        now = utc_timestamp()
         with self.transaction(immediate=True) as connection:
-            if run.status in TERMINAL_RUN_STATUSES:
-                row = connection.execute("SELECT * FROM runs WHERE id = ?", (run.id,)).fetchone()
-            elif run.status == "QUEUED":
-                connection.execute(
-                    "UPDATE runs SET status = 'CANCELED', cancel_requested = 1, finished_at = ? WHERE id = ?",
-                    (now, run.id),
-                )
-                self._append_event_locked(connection, run.id, "done", {"run_id": run.id, "status": "CANCELED"}, now)
-                row = connection.execute("SELECT * FROM runs WHERE id = ?", (run.id,)).fetchone()
-            else:
-                connection.execute("UPDATE runs SET cancel_requested = 1 WHERE id = ?", (run.id,))
-                self._append_event_locked(connection, run.id, "status", {"run_id": run.id, "status": "CANCEL_REQUESTED"}, now)
-                row = connection.execute("SELECT * FROM runs WHERE id = ?", (run.id,)).fetchone()
+            row = connection.execute("SELECT * FROM runs WHERE id = ?", (run.id,)).fetchone()
+            if row is None:
+                raise ControlPlaneError("run_not_found", "Run was not found")
+            row = self._request_cancel_locked(connection, row)
         assert row is not None
         return self._run_from_row(row)
+
+    def cancel_latest_active_run_for_internal_bridge(self, session_id: str) -> RunRecord | None:
+        """Cancel only the newest active Run in one bridge-owned session."""
+        self.get_session_for_internal_bridge(session_id)
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                """SELECT * FROM runs
+                   WHERE session_id = ? AND status IN ('PREPARING', 'QUEUED', 'LEASED', 'RUNNING')
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            row = self._request_cancel_locked(connection, row)
+        return self._run_from_row(row)
+
+    def _request_cancel_locked(self, connection: sqlite3.Connection, row: sqlite3.Row) -> sqlite3.Row:
+        """Apply cancellation under an existing immediate transaction."""
+        run_id = str(row["id"])
+        status = str(row["status"])
+        now = utc_timestamp()
+        if status in TERMINAL_RUN_STATUSES:
+            return row
+        if status in {"PREPARING", "QUEUED"}:
+            connection.execute(
+                "UPDATE runs SET status = 'CANCELED', cancel_requested = 1, finished_at = ? WHERE id = ?",
+                (now, run_id),
+            )
+            self._append_event_locked(connection, run_id, "done", {"run_id": run_id, "status": "CANCELED"}, now)
+        else:
+            connection.execute("UPDATE runs SET cancel_requested = 1 WHERE id = ?", (run_id,))
+            self._append_event_locked(connection, run_id, "status", {"run_id": run_id, "status": "CANCEL_REQUESTED"}, now)
+        updated = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        assert updated is not None
+        return updated
 
     def cancel_requested(self, run: RunRecord, executor_id: str) -> bool:
         with self.transaction() as connection:

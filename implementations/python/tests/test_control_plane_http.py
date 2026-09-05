@@ -340,6 +340,37 @@ class WorkerControlPlaneHttpTests(unittest.TestCase):
         self.assertEqual(response_headers["Content-Type"], "text/event-stream; charset=utf-8")
         self.assertIn("event: done", stream.decode("utf-8"))
 
+    def test_internal_cancel_latest_run_is_session_scoped(self) -> None:
+        headers = {"X-DSH-Internal-Token": "internal-test-token"}
+        binding = {
+            "session_id": "caller-controlled-value",
+            "external_conversation_id": "oc_cancel_1",
+            "conversation_kind": "p2p",
+            "principal_ref": "user:ou_cancel_1",
+        }
+        status, _, raw = self.request("POST", "/internal/sessions/resolve", binding, headers)
+        self.assertEqual(status, 200)
+        session = json.loads(raw)
+        status, _, raw = self.request(
+            "POST", f"/internal/sessions/{session['session_id']}/runs/prepare",
+            {"message": "cancel", "source_ref": "om_cancel_1"}, headers,
+        )
+        self.assertEqual(status, 201)
+        run_id = json.loads(raw)["run_id"]
+        status, _, raw = self.request(
+            "POST", f"/internal/sessions/{session['session_id']}/runs/cancel-latest", {}, headers,
+        )
+        self.assertEqual(status, 200)
+        canceled = json.loads(raw)
+        self.assertTrue(canceled["canceled"])
+        self.assertEqual(canceled["run_id"], run_id)
+        self.assertEqual(canceled["status"], "CANCELED")
+        status, _, raw = self.request(
+            "POST", f"/internal/sessions/{session['session_id']}/runs/cancel-latest", {}, headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(raw)["canceled"])
+
     def test_compat_chat_returns_registered_artifacts_without_server_path(self) -> None:
         with patch.object(server, "ARTIFACT_RESULT_TYPES", frozenset({"private.result"})):
             status, _, raw = self.request(

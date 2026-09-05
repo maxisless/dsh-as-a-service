@@ -1005,6 +1005,9 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/internal/sessions/") and path.endswith("/runs/prepare"):
             self.prepare_internal_run(path)
             return
+        if path.startswith("/internal/sessions/") and path.endswith("/runs/cancel-latest"):
+            self.cancel_latest_internal_run(path)
+            return
         if path.startswith("/internal/runs/") and path.endswith("/inputs/finalize"):
             self.finalize_internal_run_inputs(path)
             return
@@ -1188,6 +1191,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.CREATED if created else HTTPStatus.OK, {
                 **run_payload(run), "workspace": str(paths.workspace), "inbox": str(inbox),
             })
+        except ControlPlaneError as exc:
+            self.send_error_json(control_error_status(exc), exc.code, exc.message)
+        except ApiError as exc:
+            self.send_error_json(exc.status, exc.code, exc.message)
+
+    def cancel_latest_internal_run(self, path: str) -> None:
+        """Cancel the newest active Run for an internally authenticated session."""
+        try:
+            self.read_internal_request()
+            session_id = path.removeprefix("/internal/sessions/").removesuffix("/runs/cancel-latest")
+            if not session_id or "/" in session_id:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "Unknown endpoint")
+            run = CONTROL_PLANE.cancel_latest_active_run_for_internal_bridge(session_id)
+            _scheduler_wakeup.set()
+            response: dict[str, Any] = {"canceled": run is not None}
+            if run is not None:
+                response.update({
+                    "run_id": run.id, "status": run.status, "cancel_requested": run.cancel_requested,
+                })
+            self.send_json(HTTPStatus.OK, response)
         except ControlPlaneError as exc:
             self.send_error_json(control_error_status(exc), exc.code, exc.message)
         except ApiError as exc:
